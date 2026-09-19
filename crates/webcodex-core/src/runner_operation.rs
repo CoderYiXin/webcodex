@@ -9,18 +9,23 @@ use crate::coding_agent::{validate_request as validate_coding_agent_request, Cod
 use crate::lsp_bridge::RunnerLspPayload;
 use crate::mcp_gateway::{validate_request as validate_mcp_gateway_request, McpGatewayRequest};
 use crate::plugin::{validate_request as validate_plugin_gateway_request, PluginGatewayRequest};
+use crate::runner_instruction::{
+    RunnerInstructionRequest, RUNNER_INSTRUCTION_REQUEST_KIND, RUNNER_INSTRUCTION_REQUEST_MAX_BYTES,
+};
 use crate::runner_protocol::{
     shell_computer_request_payload_max_bytes, validate_process_argv,
     validate_raw_shell_wire_command, validate_script_request, PersistentShellRequest,
     RunnerConfigOperationRequest, RunnerRequest, ShellFileOpRequest, ShellJobContext,
     ShellJobStructuredExecutionMetadata, ShellJobValidationStep, ShellProcessArgv,
     ShellScriptLanguage, ShellScriptPayload, PROCESS_CWD_MAX_BYTES, PROCESS_STDIN_MAX_BYTES,
-    RUNNER_CONFIG_REQUEST_KIND, RUNNER_CONFIG_REQUEST_MAX_BYTES,
+    PROCESS_TIMEOUT_MAX_SECS, RUNNER_CONFIG_REQUEST_KIND, RUNNER_CONFIG_REQUEST_MAX_BYTES,
     STRUCTURED_EXECUTION_DIRECT_SYNC_TIMEOUT_MAX_SECS, STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS,
     STRUCTURED_EXECUTION_TIMEOUT_MIN_SECS,
 };
 use crate::runner_skill::{
-    RunnerSkillRequest, RUNNER_SKILL_REQUEST_KIND, RUNNER_SKILL_REQUEST_MAX_BYTES,
+    RunnerSkillExecutionRequest, RunnerSkillRequest, RUNNER_SKILL_EXECUTION_REQUEST_KIND,
+    RUNNER_SKILL_EXECUTION_REQUEST_MAX_BYTES, RUNNER_SKILL_REQUEST_KIND,
+    RUNNER_SKILL_REQUEST_MAX_BYTES,
 };
 use crate::ssh_resource::{SshResourceRequest, SSH_RESOURCE_REQUEST_MAX_BYTES};
 use crate::validation_bridge::{validate_bridge_request, ValidationBridgeRequest};
@@ -71,6 +76,13 @@ pub struct RunnerScriptOperation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerSkillResourceOperation {
+    pub cwd: Option<String>,
+    pub request: RunnerSkillExecutionRequest,
+    pub timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunnerJobShellOperation {
     pub job_id: String,
     pub cwd: Option<String>,
@@ -109,12 +121,22 @@ pub struct RunnerJobScriptOperation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerJobSkillResourceOperation {
+    pub job_id: String,
+    pub cwd: Option<String>,
+    pub request: RunnerSkillExecutionRequest,
+    pub timeout_secs: u64,
+    pub context: ShellJobContext,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunnerJobOperation {
     StartShell(RunnerJobShellOperation),
     StartValidation(RunnerJobValidationOperation),
     StartProcess(RunnerJobProcessOperation),
     StartDetachedProcess(RunnerJobProcessOperation),
     StartScript(RunnerJobScriptOperation),
+    StartSkillResource(RunnerJobSkillResourceOperation),
     Stop { job_id: String },
 }
 
@@ -127,6 +149,7 @@ impl RunnerJobOperation {
                 &operation.job_id
             }
             Self::StartScript(operation) => &operation.job_id,
+            Self::StartSkillResource(operation) => &operation.job_id,
             Self::Stop { job_id } => job_id,
         }
     }
@@ -139,6 +162,7 @@ impl RunnerJobOperation {
                 Some(&operation.context)
             }
             Self::StartScript(operation) => Some(&operation.context),
+            Self::StartSkillResource(operation) => Some(&operation.context),
             Self::Stop { .. } => None,
         }
     }
@@ -151,6 +175,7 @@ impl RunnerJobOperation {
                 operation.cwd.as_deref()
             }
             Self::StartScript(operation) => operation.cwd.as_deref(),
+            Self::StartSkillResource(operation) => operation.cwd.as_deref(),
             Self::Stop { .. } => None,
         }
     }
@@ -205,6 +230,16 @@ impl RunnerJobOperation {
                 script_bytes: Some(operation.script.script.len()),
                 arg_count: operation.script.args.len(),
                 stdin_present: operation.stdin.is_some(),
+                validation_identity: correlation.0,
+                validation_tool: correlation.1,
+                assertion_name: correlation.2,
+            }),
+            Self::StartSkillResource(operation) => Some(ShellJobStructuredExecutionMetadata {
+                execution_source: "run_skill_resource".to_string(),
+                language: None,
+                script_bytes: None,
+                arg_count: operation.request.args.len(),
+                stdin_present: true,
                 validation_identity: correlation.0,
                 validation_tool: correlation.1,
                 assertion_name: correlation.2,
@@ -492,6 +527,79 @@ pub struct RunnerComputerOperation {
     pub timeout_secs: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunnerBrowserOperationKind {
+    ListBrowsers,
+    ListPages,
+    Snapshot,
+    Screenshot,
+    Launch,
+    NewPage,
+    Navigate,
+    Click,
+    InputText,
+    SelectOption,
+    SetValue,
+    UploadFile,
+    Key,
+    ClosePage,
+    CloseBrowser,
+}
+
+impl RunnerBrowserOperationKind {
+    pub fn wire_kind(self) -> &'static str {
+        match self {
+            Self::ListBrowsers => "browser_list_browsers",
+            Self::ListPages => "browser_list_pages",
+            Self::Snapshot => "browser_snapshot",
+            Self::Screenshot => "browser_screenshot",
+            Self::Launch => "browser_launch",
+            Self::NewPage => "browser_new_page",
+            Self::Navigate => "browser_navigate",
+            Self::Click => "browser_click",
+            Self::InputText => "browser_input_text",
+            Self::SelectOption => "browser_select_option",
+            Self::SetValue => "browser_set_value",
+            Self::UploadFile => "browser_upload_file",
+            Self::Key => "browser_key",
+            Self::ClosePage => "browser_close_page",
+            Self::CloseBrowser => "browser_close",
+        }
+    }
+
+    pub fn from_wire(kind: &str) -> Option<Self> {
+        Some(match kind {
+            "browser_list_browsers" => Self::ListBrowsers,
+            "browser_list_pages" => Self::ListPages,
+            "browser_snapshot" => Self::Snapshot,
+            "browser_screenshot" => Self::Screenshot,
+            "browser_launch" => Self::Launch,
+            "browser_new_page" => Self::NewPage,
+            "browser_navigate" => Self::Navigate,
+            "browser_click" => Self::Click,
+            "browser_input_text" => Self::InputText,
+            "browser_select_option" => Self::SelectOption,
+            "browser_set_value" => Self::SetValue,
+            "browser_upload_file" => Self::UploadFile,
+            "browser_key" => Self::Key,
+            "browser_close_page" => Self::ClosePage,
+            "browser_close" => Self::CloseBrowser,
+            _ => return None,
+        })
+    }
+
+    pub fn is_large_image(self) -> bool {
+        matches!(self, Self::Screenshot)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerBrowserOperation {
+    pub kind: RunnerBrowserOperationKind,
+    pub payload: String,
+    pub timeout_secs: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct RunnerPersistentShellOperation {
     pub request: PersistentShellRequest,
@@ -507,10 +615,12 @@ pub enum RunnerOperation {
     RunProcess(RunnerProcessOperation),
     RunScript(RunnerScriptOperation),
     RunInternalPosixScript(RunnerScriptOperation),
+    RunSkillResource(RunnerSkillResourceOperation),
     Job(RunnerJobOperation),
     File(RunnerFileOperation),
     Project(RunnerProjectOperation),
     Computer(RunnerComputerOperation),
+    Browser(RunnerBrowserOperation),
     Validation {
         payload: ValidationBridgeRequest,
         timeout_secs: u64,
@@ -526,6 +636,7 @@ pub enum RunnerOperation {
     Skill(RunnerSkillRequest),
     SshResource(SshResourceRequest),
     RunnerConfig(RunnerConfigOperationRequest),
+    RunnerInstruction(RunnerInstructionRequest),
 }
 
 impl RunnerOperation {
@@ -535,17 +646,20 @@ impl RunnerOperation {
             Self::RunProcess(_) => "run_process",
             Self::RunScript(_) => "run_script",
             Self::RunInternalPosixScript(_) => "run_internal_posix_script",
+            Self::RunSkillResource(_) => RUNNER_SKILL_EXECUTION_REQUEST_KIND,
             Self::Job(operation) => match operation {
                 RunnerJobOperation::StartShell(_) => "start_job",
                 RunnerJobOperation::StartValidation(_) => "start_validation_job",
                 RunnerJobOperation::StartProcess(_) => "start_process_job",
                 RunnerJobOperation::StartDetachedProcess(_) => "start_detached_process_job",
                 RunnerJobOperation::StartScript(_) => "start_script_job",
+                RunnerJobOperation::StartSkillResource(_) => "start_skill_resource_job",
                 RunnerJobOperation::Stop { .. } => "stop_job",
             },
             Self::File(operation) => operation.wire_kind(),
             Self::Project(operation) => operation.kind.wire_kind(),
             Self::Computer(operation) => operation.kind.wire_kind(),
+            Self::Browser(operation) => operation.kind.wire_kind(),
             Self::Validation { .. } => crate::validation_bridge::AGENT_VALIDATION_REQUEST_KIND,
             Self::Lsp { .. } => crate::lsp_bridge::AGENT_LSP_REQUEST_KIND,
             Self::PersistentShell(_) => "persistent_shell",
@@ -555,6 +669,7 @@ impl RunnerOperation {
             Self::Skill(_) => RUNNER_SKILL_REQUEST_KIND,
             Self::SshResource(_) => "ssh_resource",
             Self::RunnerConfig(_) => RUNNER_CONFIG_REQUEST_KIND,
+            Self::RunnerInstruction(_) => RUNNER_INSTRUCTION_REQUEST_KIND,
         }
     }
 
@@ -568,6 +683,7 @@ impl RunnerOperation {
     pub fn is_large_native_image_request(&self) -> bool {
         match self {
             Self::Computer(operation) => operation.kind.is_large_image(),
+            Self::Browser(operation) => operation.kind.is_large_image(),
             Self::File(RunnerFileOperation::ReadProjectArtifact(payload)) => payload
                 .content
                 .as_deref()
@@ -576,6 +692,13 @@ impl RunnerOperation {
                 .unwrap_or(false),
             _ => false,
         }
+    }
+
+    pub fn is_large_internal_artifact_chunk_request(&self) -> bool {
+        matches!(
+            self,
+            Self::File(RunnerFileOperation::ReadProjectArtifactExportChunk(_))
+        )
     }
 }
 
@@ -686,6 +809,26 @@ fn encode_operation(
             wire.script = Some(operation.script);
             wire.timeout_secs = operation.timeout_secs;
         }
+        RunnerOperation::RunSkillResource(operation) => {
+            operation
+                .request
+                .validate()
+                .map_err(|error| format!("invalid Runner Skill execution request: {error}"))?;
+            validate_direct_structured_common(
+                operation.cwd.as_deref(),
+                None,
+                operation.timeout_secs,
+            )?;
+            let content = serde_json::to_string(&operation.request).map_err(|error| {
+                format!("could not encode Runner Skill execution request: {error}")
+            })?;
+            if content.len() > RUNNER_SKILL_EXECUTION_REQUEST_MAX_BYTES {
+                return Err("Runner Skill execution request exceeds V2 payload bound".to_string());
+            }
+            wire.cwd = operation.cwd;
+            wire.content = Some(content);
+            wire.timeout_secs = operation.timeout_secs;
+        }
         RunnerOperation::Job(operation) => encode_job_operation(&mut wire, operation)?,
         RunnerOperation::File(operation) => {
             let payload = operation.payload().clone();
@@ -710,6 +853,12 @@ fn encode_operation(
         }
         RunnerOperation::Computer(operation) => {
             validate_computer_payload(operation.kind, &operation.payload)?;
+            wire.kind = operation.kind.wire_kind().to_string();
+            wire.stdin = Some(operation.payload);
+            wire.timeout_secs = operation.timeout_secs.max(1);
+        }
+        RunnerOperation::Browser(operation) => {
+            validate_browser_payload(operation.kind, &operation.payload)?;
             wire.kind = operation.kind.wire_kind().to_string();
             wire.stdin = Some(operation.payload);
             wire.timeout_secs = operation.timeout_secs.max(1);
@@ -780,6 +929,18 @@ fn encode_operation(
             wire.content = Some(content);
             wire.timeout_secs = 60;
         }
+        RunnerOperation::RunnerInstruction(operation) => {
+            operation
+                .validate()
+                .map_err(|error| format!("invalid Runner instruction request: {error}"))?;
+            let content = serde_json::to_string(&operation)
+                .map_err(|error| format!("could not encode Runner instruction request: {error}"))?;
+            if content.len() > RUNNER_INSTRUCTION_REQUEST_MAX_BYTES {
+                return Err("Runner instruction request exceeds V2 payload bound".to_string());
+            }
+            wire.content = Some(content);
+            wire.timeout_secs = 30;
+        }
         RunnerOperation::RunnerConfig(operation) => {
             operation
                 .validate()
@@ -806,6 +967,7 @@ fn encode_job_operation(
         RunnerJobOperation::StartProcess(_) => "start_process_job",
         RunnerJobOperation::StartDetachedProcess(_) => "start_detached_process_job",
         RunnerJobOperation::StartScript(_) => "start_script_job",
+        RunnerJobOperation::StartSkillResource(_) => "start_skill_resource_job",
         RunnerJobOperation::Stop { .. } => "stop_job",
     }
     .to_string();
@@ -843,6 +1005,7 @@ fn encode_job_operation(
                 operation.cwd.as_deref(),
                 operation.stdin.as_deref(),
                 operation.timeout_secs,
+                PROCESS_TIMEOUT_MAX_SECS,
             )?;
             validate_process_argv(&operation.process)?;
             validate_job_context_coherence(operation.cwd.as_deref(), &operation.context)?;
@@ -865,6 +1028,30 @@ fn encode_job_operation(
             wire.cwd = operation.cwd;
             wire.script = Some(operation.script);
             wire.stdin = operation.stdin;
+            wire.timeout_secs = operation.timeout_secs;
+            wire.job_context = Some(operation.context);
+        }
+        RunnerJobOperation::StartSkillResource(operation) => {
+            operation
+                .request
+                .validate()
+                .map_err(|error| format!("invalid Runner Skill execution request: {error}"))?;
+            validate_structured_job_common(
+                operation.cwd.as_deref(),
+                None,
+                operation.timeout_secs,
+                STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS,
+            )?;
+            validate_job_context_coherence(operation.cwd.as_deref(), &operation.context)?;
+            let content = serde_json::to_string(&operation.request).map_err(|error| {
+                format!("could not encode Runner Skill execution request: {error}")
+            })?;
+            if content.len() > RUNNER_SKILL_EXECUTION_REQUEST_MAX_BYTES {
+                return Err("Runner Skill execution request exceeds V2 payload bound".to_string());
+            }
+            wire.job_id = Some(operation.job_id);
+            wire.cwd = operation.cwd;
+            wire.content = Some(content);
             wire.timeout_secs = operation.timeout_secs;
             wire.job_context = Some(operation.context);
         }
@@ -939,11 +1126,43 @@ fn decode_operation(wire: &RunnerRequest) -> Result<RunnerOperation, String> {
                 RunnerOperation::RunScript(operation)
             })
         }
+        RUNNER_SKILL_EXECUTION_REQUEST_KIND => {
+            ensure_special_payloads_absent(wire)?;
+            ensure_no_file_fields_except_content(wire)?;
+            if wire.job_id.is_some()
+                || wire.job_context.is_some()
+                || !wire.command.is_empty()
+                || wire.stdin.is_some()
+            {
+                return Err(
+                    "skill_resource_execution contains incompatible execution fields".to_string(),
+                );
+            }
+            let content = bounded_content(
+                wire,
+                RUNNER_SKILL_EXECUTION_REQUEST_MAX_BYTES,
+                RUNNER_SKILL_EXECUTION_REQUEST_KIND,
+            )?;
+            let request = serde_json::from_str::<RunnerSkillExecutionRequest>(content)
+                .map_err(|error| format!("invalid Runner Skill execution payload: {error}"))?;
+            request
+                .validate()
+                .map_err(|error| format!("invalid Runner Skill execution request: {error}"))?;
+            validate_direct_structured_common(wire.cwd.as_deref(), None, wire.timeout_secs)?;
+            Ok(RunnerOperation::RunSkillResource(
+                RunnerSkillResourceOperation {
+                    cwd: wire.cwd.clone(),
+                    request,
+                    timeout_secs: wire.timeout_secs,
+                },
+            ))
+        }
         "start_job"
         | "start_validation_job"
         | "start_process_job"
         | "start_detached_process_job"
         | "start_script_job"
+        | "start_skill_resource_job"
         | "stop_job" => decode_job_operation(wire).map(RunnerOperation::Job),
         kind if kind.starts_with("file_") => {
             ensure_special_payloads_absent(wire)?;
@@ -1012,6 +1231,29 @@ fn decode_operation(wire: &RunnerRequest) -> Result<RunnerOperation, String> {
                 .ok_or_else(|| "computer operation requires JSON payload".to_string())?;
             validate_computer_payload(operation_kind, &payload)?;
             Ok(RunnerOperation::Computer(RunnerComputerOperation {
+                kind: operation_kind,
+                payload,
+                timeout_secs: wire.timeout_secs,
+            }))
+        }
+        kind if RunnerBrowserOperationKind::from_wire(kind).is_some() => {
+            ensure_special_payloads_absent(wire)?;
+            ensure_no_file_fields(wire)?;
+            if wire.job_id.is_some()
+                || wire.cwd.is_some()
+                || !wire.command.is_empty()
+                || wire.job_context.is_some()
+            {
+                return Err("browser operation contains incompatible execution fields".to_string());
+            }
+            let operation_kind =
+                RunnerBrowserOperationKind::from_wire(kind).expect("checked browser kind");
+            let payload = wire
+                .stdin
+                .clone()
+                .ok_or_else(|| "browser operation requires JSON payload".to_string())?;
+            validate_browser_payload(operation_kind, &payload)?;
+            Ok(RunnerOperation::Browser(RunnerBrowserOperation {
                 kind: operation_kind,
                 payload,
                 timeout_secs: wire.timeout_secs,
@@ -1126,6 +1368,21 @@ fn decode_operation(wire: &RunnerRequest) -> Result<RunnerOperation, String> {
                 .map_err(|error| format!("invalid SSH resource request: {error}"))?;
             Ok(RunnerOperation::SshResource(operation))
         }
+        RUNNER_INSTRUCTION_REQUEST_KIND => {
+            ensure_special_payloads_absent(wire)?;
+            ensure_empty_generic_execution_fields(wire, true)?;
+            let content = bounded_content(
+                wire,
+                RUNNER_INSTRUCTION_REQUEST_MAX_BYTES,
+                RUNNER_INSTRUCTION_REQUEST_KIND,
+            )?;
+            let operation = serde_json::from_str::<RunnerInstructionRequest>(content)
+                .map_err(|error| format!("invalid Runner instruction payload: {error}"))?;
+            operation
+                .validate()
+                .map_err(|error| format!("invalid Runner instruction request: {error}"))?;
+            Ok(RunnerOperation::RunnerInstruction(operation))
+        }
         RUNNER_CONFIG_REQUEST_KIND => {
             ensure_special_payloads_absent(wire)?;
             ensure_empty_generic_execution_fields(wire, true)?;
@@ -1142,7 +1399,11 @@ fn decode_operation(wire: &RunnerRequest) -> Result<RunnerOperation, String> {
 }
 
 fn decode_job_operation(wire: &RunnerRequest) -> Result<RunnerJobOperation, String> {
-    ensure_no_file_fields(wire)?;
+    if wire.kind == "start_skill_resource_job" {
+        ensure_no_file_fields_except_content(wire)?;
+    } else {
+        ensure_no_file_fields(wire)?;
+    }
     let job_id = wire
         .job_id
         .clone()
@@ -1217,6 +1478,7 @@ fn decode_job_operation(wire: &RunnerRequest) -> Result<RunnerJobOperation, Stri
                 wire.cwd.as_deref(),
                 wire.stdin.as_deref(),
                 wire.timeout_secs,
+                PROCESS_TIMEOUT_MAX_SECS,
             )?;
             let operation = RunnerJobProcessOperation {
                 job_id,
@@ -1276,6 +1538,48 @@ fn decode_job_operation(wire: &RunnerRequest) -> Result<RunnerJobOperation, Stri
             }
             Ok(job)
         }
+        "start_skill_resource_job" => {
+            ensure_special_payloads_absent(wire)?;
+            if !wire.command.is_empty() || wire.stdin.is_some() || context.ssh_resource.is_some() {
+                return Err(
+                    "typed Skill resource Job contains incompatible execution fields".to_string(),
+                );
+            }
+            let content = bounded_content(
+                wire,
+                RUNNER_SKILL_EXECUTION_REQUEST_MAX_BYTES,
+                RUNNER_SKILL_EXECUTION_REQUEST_KIND,
+            )?;
+            let request = serde_json::from_str::<RunnerSkillExecutionRequest>(content)
+                .map_err(|error| format!("invalid Runner Skill execution payload: {error}"))?;
+            request
+                .validate()
+                .map_err(|error| format!("invalid Runner Skill execution request: {error}"))?;
+            validate_structured_job_common(
+                wire.cwd.as_deref(),
+                None,
+                wire.timeout_secs,
+                STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS,
+            )?;
+            let job = RunnerJobOperation::StartSkillResource(RunnerJobSkillResourceOperation {
+                job_id,
+                cwd: wire.cwd.clone(),
+                request,
+                timeout_secs: wire.timeout_secs,
+                context,
+            });
+            if job
+                .context()
+                .and_then(|ctx| ctx.structured_execution.clone())
+                != job.expected_structured_execution()
+            {
+                return Err(
+                    "Skill resource Job recovery metadata does not match typed operation"
+                        .to_string(),
+                );
+            }
+            Ok(job)
+        }
         _ => unreachable!("decode_job_operation called for non-job kind"),
     }
 }
@@ -1329,13 +1633,12 @@ fn validate_structured_job_common(
     cwd: Option<&str>,
     stdin: Option<&str>,
     timeout_secs: u64,
+    timeout_max_secs: u64,
 ) -> Result<(), String> {
     validate_structured_text_fields(cwd, stdin)?;
-    if !(STRUCTURED_EXECUTION_TIMEOUT_MIN_SECS..=STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS)
-        .contains(&timeout_secs)
-    {
+    if !(STRUCTURED_EXECUTION_TIMEOUT_MIN_SECS..=timeout_max_secs).contains(&timeout_secs) {
         return Err(format!(
-            "timeout_secs must be between {STRUCTURED_EXECUTION_TIMEOUT_MIN_SECS} and {STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS}"
+            "timeout_secs must be between {STRUCTURED_EXECUTION_TIMEOUT_MIN_SECS} and {timeout_max_secs}"
         ));
     }
     Ok(())
@@ -1444,6 +1747,17 @@ fn validate_computer_payload(
     validate_json_payload(payload, "computer operation")
 }
 
+fn validate_browser_payload(
+    _kind: RunnerBrowserOperationKind,
+    payload: &str,
+) -> Result<(), String> {
+    const MAX_BROWSER_REQUEST_PAYLOAD_BYTES: usize = 32 * 1024;
+    if payload.len() > MAX_BROWSER_REQUEST_PAYLOAD_BYTES {
+        return Err("browser request payload exceeds V2 bound".to_string());
+    }
+    validate_json_payload(payload, "browser operation")
+}
+
 fn validate_persistent_shell(request: &PersistentShellRequest) -> Result<(), String> {
     if !matches!(
         request.action.as_str(),
@@ -1477,6 +1791,20 @@ fn bounded_content<'a>(
         return Err(format!("{label} content payload is invalid or oversized"));
     }
     Ok(content)
+}
+
+fn ensure_no_file_fields_except_content(wire: &RunnerRequest) -> Result<(), String> {
+    if wire.path.is_some()
+        || wire.max_bytes.is_some()
+        || wire.expected_sha256.is_some()
+        || wire.expected_prefix.is_some()
+        || wire.start_line.is_some()
+        || wire.end_line.is_some()
+        || wire.create_dirs
+    {
+        return Err(format!("{} contains incompatible file fields", wire.kind));
+    }
+    Ok(())
 }
 
 fn ensure_no_file_fields(wire: &RunnerRequest) -> Result<(), String> {
@@ -1725,6 +2053,18 @@ mod tests {
         }
     }
 
+    fn skill_execution_request() -> RunnerSkillExecutionRequest {
+        RunnerSkillExecutionRequest {
+            skill_id: "wc_skill_qqqqqqqqqqqqqqqqqqqqqg".to_string(),
+            expected_source: crate::runner_skill::RunnerSkillSource::Configured,
+            path: "scripts/probe.py".to_string(),
+            expected_definition_revision: "b".repeat(64),
+            expected_package_revision: None,
+            expected_resource_sha256: "c".repeat(64),
+            args: vec!["literal".to_string()],
+        }
+    }
+
     #[test]
     fn omitted_v2_kind_keeps_legacy_run_shell_default() {
         let value = serde_json::json!({
@@ -1773,6 +2113,139 @@ mod tests {
             args: Vec::new(),
         });
         assert!(wire.decode_operation().unwrap_err().contains("conflicts"));
+    }
+
+    #[test]
+    fn durable_long_process_script_jobs_round_trip_while_direct_and_skill_limits_stay_bounded() {
+        let process = ShellProcessArgv {
+            executable: "printf".to_string(),
+            args: vec!["ok".to_string()],
+        };
+        for (operation, expected_kind) in [
+            (
+                RunnerOperation::Job(RunnerJobOperation::StartProcess(
+                    RunnerJobProcessOperation {
+                        job_id: "job-long-process".to_string(),
+                        cwd: Some("/repo".to_string()),
+                        process: process.clone(),
+                        stdin: None,
+                        timeout_secs: 21_600,
+                        context: structured_job_context(
+                            Some("/repo"),
+                            "run_process",
+                            None,
+                            None,
+                            1,
+                            false,
+                        ),
+                    },
+                )),
+                "start_process_job",
+            ),
+            (
+                RunnerOperation::Job(RunnerJobOperation::StartDetachedProcess(
+                    RunnerJobProcessOperation {
+                        job_id: "job-long-detached".to_string(),
+                        cwd: Some("/repo".to_string()),
+                        process: process.clone(),
+                        stdin: None,
+                        timeout_secs: 21_600,
+                        context: structured_job_context(
+                            Some("/repo"),
+                            "run_detached_process",
+                            None,
+                            None,
+                            1,
+                            false,
+                        ),
+                    },
+                )),
+                "start_detached_process_job",
+            ),
+        ] {
+            let wire = round_trip_kind(operation);
+            assert_eq!(wire.kind, expected_kind);
+            assert_eq!(wire.timeout_secs, 21_600);
+        }
+
+        let script = ShellScriptPayload {
+            language: ShellScriptLanguage::Sh,
+            script: "printf ok".to_string(),
+            args: Vec::new(),
+        };
+        let script_wire = round_trip_kind(RunnerOperation::Job(RunnerJobOperation::StartScript(
+            RunnerJobScriptOperation {
+                job_id: "job-long-script".to_string(),
+                cwd: Some("/repo".to_string()),
+                script: script.clone(),
+                stdin: None,
+                timeout_secs: 21_600,
+                context: structured_job_context(
+                    Some("/repo"),
+                    "run_script",
+                    Some(ShellScriptLanguage::Sh),
+                    Some(script.script.len()),
+                    0,
+                    false,
+                ),
+            },
+        )));
+        assert_eq!(script_wire.timeout_secs, 21_600);
+
+        let oversized_process = RunnerOperation::Job(RunnerJobOperation::StartProcess(
+            RunnerJobProcessOperation {
+                job_id: "job-too-long".to_string(),
+                cwd: None,
+                process: process.clone(),
+                stdin: None,
+                timeout_secs: PROCESS_TIMEOUT_MAX_SECS + 1,
+                context: structured_job_context(None, "run_process", None, None, 1, false),
+            },
+        ));
+        assert!(RunnerRequest::from_operation(metadata(), oversized_process)
+            .unwrap_err()
+            .contains(&PROCESS_TIMEOUT_MAX_SECS.to_string()));
+
+        let direct_process = RunnerOperation::RunProcess(RunnerProcessOperation {
+            cwd: None,
+            process,
+            stdin: None,
+            timeout_secs: STRUCTURED_EXECUTION_DIRECT_SYNC_TIMEOUT_MAX_SECS + 1,
+        });
+        assert!(RunnerRequest::from_operation(metadata(), direct_process)
+            .unwrap_err()
+            .contains(&STRUCTURED_EXECUTION_DIRECT_SYNC_TIMEOUT_MAX_SECS.to_string()));
+
+        let direct_script = RunnerOperation::RunScript(RunnerScriptOperation {
+            cwd: None,
+            script,
+            stdin: None,
+            timeout_secs: STRUCTURED_EXECUTION_DIRECT_SYNC_TIMEOUT_MAX_SECS + 1,
+        });
+        assert!(RunnerRequest::from_operation(metadata(), direct_script)
+            .unwrap_err()
+            .contains(&STRUCTURED_EXECUTION_DIRECT_SYNC_TIMEOUT_MAX_SECS.to_string()));
+
+        let skill_request = skill_execution_request();
+        let skill_job = RunnerOperation::Job(RunnerJobOperation::StartSkillResource(
+            RunnerJobSkillResourceOperation {
+                job_id: "job-long-skill".to_string(),
+                cwd: None,
+                request: skill_request.clone(),
+                timeout_secs: STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS + 1,
+                context: structured_job_context(
+                    None,
+                    "run_skill_resource",
+                    None,
+                    None,
+                    skill_request.args.len(),
+                    true,
+                ),
+            },
+        ));
+        assert!(RunnerRequest::from_operation(metadata(), skill_job)
+            .unwrap_err()
+            .contains(&STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS.to_string()));
     }
 
     #[test]
@@ -1872,6 +2345,7 @@ mod tests {
             script: "printf ok".to_string(),
             args: vec!["literal".to_string()],
         };
+        let skill_request = skill_execution_request();
         let validation_step = ShellJobValidationStep {
             name: "check".to_string(),
             program: "cargo".to_string(),
@@ -1912,6 +2386,11 @@ mod tests {
                     args: Vec::new(),
                 },
                 stdin: None,
+                timeout_secs: 30,
+            }),
+            RunnerOperation::RunSkillResource(RunnerSkillResourceOperation {
+                cwd: Some("/repo".to_string()),
+                request: skill_request.clone(),
                 timeout_secs: 30,
             }),
             RunnerOperation::Job(RunnerJobOperation::StartShell(RunnerJobShellOperation {
@@ -1985,6 +2464,22 @@ mod tests {
                     false,
                 ),
             })),
+            RunnerOperation::Job(RunnerJobOperation::StartSkillResource(
+                RunnerJobSkillResourceOperation {
+                    job_id: "job-skill-resource".to_string(),
+                    cwd: Some("/repo".to_string()),
+                    request: skill_request.clone(),
+                    timeout_secs: 60,
+                    context: structured_job_context(
+                        Some("/repo"),
+                        "run_skill_resource",
+                        None,
+                        None,
+                        skill_request.args.len(),
+                        true,
+                    ),
+                },
+            )),
             RunnerOperation::Job(RunnerJobOperation::Stop {
                 job_id: "job-stop".to_string(),
             }),
@@ -2121,11 +2616,13 @@ mod tests {
             "run_process",
             "run_script",
             "run_internal_posix_script",
+            RUNNER_SKILL_EXECUTION_REQUEST_KIND,
             "start_job",
             "start_validation_job",
             "start_process_job",
             "start_detached_process_job",
             "start_script_job",
+            "start_skill_resource_job",
             "stop_job",
             "file_read",
             "file_write",

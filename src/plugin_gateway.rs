@@ -10,6 +10,8 @@ pub(crate) use webcodex_core::plugin::*;
 use crate::auth::{AuthContext, SCOPE_PLUGIN_INSPECT, SCOPE_PLUGIN_INVOKE, SCOPE_PLUGIN_MANAGE};
 use crate::json_measurement::serialized_json_len;
 use crate::tool_runtime::sessions::SessionTransport;
+#[cfg(test)]
+use crate::tool_runtime::specialized::SpecializedAuthorityRequirement;
 use crate::tool_runtime::specialized::{
     SpecializedGovernanceDenial, SpecializedOperationPolicy, SpecializedSource,
 };
@@ -19,6 +21,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::Duration;
+use webcodex_tool_contracts::PluginToolAction;
 
 pub(crate) const PLUGIN_TOOL_NAME: &str = "plugin_tool";
 const MAX_PLUGIN_BINDINGS: usize = 512;
@@ -143,18 +146,19 @@ pub(crate) enum PluginOperation {
     Call,
 }
 
-impl PluginOperation {
-    fn parse(action: &str) -> Option<Self> {
+impl From<PluginToolAction> for PluginOperation {
+    fn from(action: PluginToolAction) -> Self {
         match action {
-            "list" => Some(Self::List),
-            "check" => Some(Self::Check),
-            "reload" => Some(Self::Reload),
-            "describe" => Some(Self::Describe),
-            "call" => Some(Self::Call),
-            _ => None,
+            PluginToolAction::List => Self::List,
+            PluginToolAction::Check => Self::Check,
+            PluginToolAction::Reload => Self::Reload,
+            PluginToolAction::Describe => Self::Describe,
+            PluginToolAction::Call => Self::Call,
         }
     }
+}
 
+impl PluginOperation {
     pub(crate) fn policy(self) -> SpecializedOperationPolicy {
         match self {
             Self::List => SpecializedOperationPolicy::read(
@@ -357,8 +361,7 @@ pub(crate) async fn invoke(
     auth: Option<&AuthContext>,
     transport: SessionTransport,
 ) -> Result<PluginInvocationResult, SpecializedGovernanceDenial> {
-    let operation = PluginOperation::parse(&request.action)
-        .expect("PluginToolCall parser admits only the closed action vocabulary");
+    let operation = PluginOperation::from(request.action);
     let policy = operation.policy();
     let audit = audit_request_with_identity(runtime, &request, auth).await;
     let permit = runtime
@@ -1479,16 +1482,16 @@ mod tests {
             SpecializedEffect::Management
         );
         assert_eq!(
-            PluginOperation::Check.policy().required_scope,
-            SCOPE_PLUGIN_MANAGE
+            PluginOperation::Check.policy().authority,
+            SpecializedAuthorityRequirement::Scope(SCOPE_PLUGIN_MANAGE)
         );
         assert!(!PluginOperation::Check.policy().write_like);
         assert!(PluginOperation::Check.policy().shell_like);
         assert!(PluginOperation::Reload.policy().write_like);
         assert!(PluginOperation::Reload.policy().shell_like);
         assert_eq!(
-            PluginOperation::Call.policy().required_scope,
-            SCOPE_PLUGIN_INVOKE
+            PluginOperation::Call.policy().authority,
+            SpecializedAuthorityRequirement::Scope(SCOPE_PLUGIN_INVOKE)
         );
     }
 }

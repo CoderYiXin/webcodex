@@ -17,6 +17,10 @@ use webcodex_core::runner_protocol::RunnerCapabilities;
 
 pub mod paths;
 
+/// Desktop injects provider credentials under these private source names. Only
+/// explicit MCP env_from_env mappings may inherit them, not ordinary job children.
+pub const DESKTOP_MCP_ENV_PREFIX: &str = "WEBCODEX_DESKTOP_MCP_";
+
 /// Default Runner project registry selected for a new system-level install.
 pub const DEFAULT_INIT_PROJECT_REGISTRY_DIR: &str = "/etc/webcodex/project-registry";
 pub const DEFAULT_POLL_INTERVAL_MS: u64 = 1000;
@@ -295,7 +299,15 @@ pub fn generated_runner_config_toml(opts: &RunnerInitOptions) -> Result<String, 
             // Runner-local Skill runtime and management are implemented by the
             // running binary and are never inferred from project/file capabilities.
             skill_runtime: false,
+            // Trusted Skill resource execution is implemented by the running binary
+            // and must not be inferred from static generated config.
+            skill_resource_execution: false,
             skill_management: false,
+            // Browser availability is a process-local executable/runtime fact.
+            // Generated config must not claim Browser capabilities.
+            browser_observe: false,
+            browser_control: false,
+            browser_launch: false,
             // Desktop observation is a runtime/platform capability and is never
             // claimed by generated static config.
             computer_observe: false,
@@ -347,6 +359,7 @@ pub fn generated_runner_config_toml(opts: &RunnerInitOptions) -> Result<String, 
             // against its startup-bound path and must never be inferred from a
             // generated static runner.toml capability block.
             runner_config_control: false,
+            instruction_runtime: false,
         },
         policy: GeneratedRunnerPolicy {
             allow_raw_shell: true,

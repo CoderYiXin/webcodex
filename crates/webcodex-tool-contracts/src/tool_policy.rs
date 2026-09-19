@@ -5,7 +5,7 @@ use super::metadata::{
 };
 use super::tool_definition::{
     tool_definitions, RunnerCapabilityRequirement, ToolActivityInteraction, ToolActivityKind,
-    ToolActivityPresentation, ToolActivitySemantics, ToolAuditPolicy, ToolContextContinuityPolicy,
+    ToolActivityPresentation, ToolActivitySemantics, ToolAuditPolicy, ToolCompositionPolicy,
     ToolDefinition, ToolDiffReviewEvidence, ToolEffectAnnotations, ToolExecutionContract,
     ToolExecutionForm, ToolExplorationEvidence, ToolGptActionExposure, ToolOperatorExtensionFamily,
     ToolReviewEvidence, ToolSessionEvidencePolicy, ToolValidationIdentityKind,
@@ -67,25 +67,21 @@ impl ToolDefinition {
     }
 
     pub fn adaptive_runtime_direct_rank(self) -> Option<u16> {
-        self.model_surface.adaptive_runtime_direct_rank
+        self.adaptive_runtime_direct_rank
     }
 
     pub fn gpt_action_exposure(self) -> ToolGptActionExposure {
-        self.model_surface.gpt_action_exposure
+        self.gpt_action_exposure
     }
 
     pub fn supports_gpt_actions(self) -> bool {
         self.visibility.is_model_visible()
-            && self.gpt_action_exposure() == ToolGptActionExposure::Inherit
+            && self.gpt_action_exposure() != ToolGptActionExposure::Unsupported
     }
 
     pub fn gpt_action_description(self) -> Option<&'static str> {
         self.model_spec
             .map(|spec| spec.gpt_action_description.unwrap_or(spec.description))
-    }
-
-    pub fn context_continuity_policy(self) -> ToolContextContinuityPolicy {
-        self.policy.context_continuity
     }
 
     pub fn session_evidence_policy(self) -> ToolSessionEvidencePolicy {
@@ -101,7 +97,9 @@ impl ToolDefinition {
                 ToolExplorationEvidence::Read | ToolExplorationEvidence::ReadBatch => {
                     return ToolActivityKind::Read;
                 }
-                ToolExplorationEvidence::Search | ToolExplorationEvidence::SearchBatch => {
+                ToolExplorationEvidence::Search
+                | ToolExplorationEvidence::SearchBatch
+                | ToolExplorationEvidence::SearchCompound => {
                     return ToolActivityKind::Search;
                 }
                 ToolExplorationEvidence::Navigation(_) => return ToolActivityKind::Navigate,
@@ -231,6 +229,14 @@ pub fn runtime_tool_execution_contract(name: &str) -> Option<ToolExecutionContra
     lookup_tool_definition(name).and_then(|definition| definition.execution)
 }
 
+/// Canonical nested-orchestration scheduling policy. Unknown/non-runtime names
+/// fail closed and are never composable by implication from effect metadata.
+pub fn runtime_tool_composition_policy(name: &str) -> ToolCompositionPolicy {
+    lookup_tool_definition(name)
+        .map(|definition| definition.composition)
+        .unwrap_or(ToolCompositionPolicy::Denied)
+}
+
 pub fn runtime_tool_session_evidence_policy(name: &str) -> ToolSessionEvidencePolicy {
     lookup_tool_definition(name)
         .map(|definition| definition.session_evidence_policy())
@@ -291,25 +297,6 @@ pub fn runtime_tool_metadata(name: &str) -> ToolMetadata {
         Ok(definition) => definition.metadata(),
         Err(metadata) => metadata,
     }
-}
-
-fn tool_context_continuity_policy(name: &str) -> ToolContextContinuityPolicy {
-    lookup_tool_definition(name)
-        .map(|definition| definition.context_continuity_policy())
-        .unwrap_or(ToolContextContinuityPolicy::CONSERVATIVE)
-}
-
-#[cfg(any(test, feature = "root-test-support"))]
-pub fn runtime_tool_context_continuity_policy(name: &str) -> ToolContextContinuityPolicy {
-    tool_context_continuity_policy(name)
-}
-
-pub fn runtime_tool_accepts_context_ack(name: &str) -> bool {
-    tool_context_continuity_policy(name).accepts_context_ack
-}
-
-pub fn runtime_tool_advances_context_checkpoint(name: &str) -> bool {
-    tool_context_continuity_policy(name).advances_context_checkpoint()
 }
 
 pub fn runtime_tool_effect_annotations(name: &str) -> ToolEffectAnnotations {
@@ -455,13 +442,17 @@ pub fn adaptive_runtime_direct_tool_definitions() -> Vec<&'static ToolDefinition
     definitions
 }
 
-/// GPT Actions ordinary direct exposure is a pure projection of Adaptive
-/// Runtime Direct. Protocol exceptions stay on the canonical ToolDefinition;
-/// there is deliberately no second rank or operation registry.
+/// GPT Actions ordinary direct exposure follows Adaptive Runtime Direct while
+/// canonical ToolDefinition exposure may route a compatible tool through the
+/// gateway to satisfy a concrete surface budget. There is deliberately no
+/// second rank or operation registry.
 pub fn gpt_action_direct_tool_definitions() -> Vec<&'static ToolDefinition> {
     adaptive_runtime_direct_tool_definitions()
         .into_iter()
-        .filter(|definition| definition.supports_gpt_actions())
+        .filter(|definition| {
+            definition.supports_gpt_actions()
+                && definition.gpt_action_exposure() != ToolGptActionExposure::GatewayOnly
+        })
         .collect()
 }
 

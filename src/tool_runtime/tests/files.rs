@@ -5,6 +5,7 @@ use super::super::helpers::*;
 use super::super::*;
 use super::support::*;
 use crate::runner_protocol::{RunnerCapabilities, RunnerRequest, RunnerResultRequest};
+use crate::tool_runtime::tool_audit::ToolCallAuditProjection;
 use serde_json::{json, Value};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -351,7 +352,7 @@ async fn write_project_file_with_session_id_records_changed_path_without_content
             include_workspace: Some(false),
             include_checkpoints: Some(false),
             include_validation: Some(false),
-            summary_only: false,
+            diagnostic: true,
             limit: None,
         })
         .await;
@@ -1076,7 +1077,7 @@ async fn conversation_import_durable_session_events_do_not_store_host_file_refs(
         .error
         .as_deref()
         .unwrap_or_default()
-        .contains("explicitly trusted MCP host-file rewrite"));
+        .contains("authenticated MCP OAuth host-file provenance"));
 
     let summary = runtime
         .sessions
@@ -1168,7 +1169,7 @@ async fn artifact_upload_begin_policy_rejection_is_classified() {
         .dispatch_with_auth(
             ToolCall::ArtifactUploadBegin {
                 project,
-                path: "artifacts/smoke/raw.bin".to_string(),
+                path: ".env".to_string(),
                 session_id: Some(session.session_id.clone()),
                 expected_bytes: Some(1),
                 expected_sha256: None,
@@ -1184,8 +1185,7 @@ async fn artifact_upload_begin_policy_rejection_is_classified() {
     assert_eq!(result.output["failure_kind"], "policy_rejected");
     assert_eq!(result.output["error_kind"], "policy_rejected");
     let error = result.error.as_deref().unwrap();
-    assert!(error.contains(".artifact"), "{error}");
-    assert!(error.contains("artifacts/smoke/<name>.artifact"), "{error}");
+    assert!(error.contains("sensitive artifact path"), "{error}");
     assert!(
         probe_patch_agent_request(&runtime, "artifact-policy-session")
             .await
@@ -2924,17 +2924,13 @@ fn search_overlong_match_line_does_not_overflow_byte_budget() {
     std::fs::create_dir_all(&root).unwrap();
     // Fake rg emits one small complete match followed by a single enormous
     // match line that itself exceeds the byte budget; it then exits cleanly.
-    // Pure shell so it needs nothing from the restricted PATH.
-    write_executable_script(
-        &bin.join("rg"),
-        "#!/bin/sh\n\
-         printf 'src/small.rs:1:needle ok\\n'\n\
-         printf 'src/big.rs:2:'\n\
-         i=0\n\
-         while [ \"$i\" -lt 200000 ]; do printf 'x'; i=$((i + 1)); done\n\
-         printf '\\n'\n\
-         exit 0\n",
+    // Materialize the long payload once in the fixture instead of performing
+    // hundreds of thousands of shell-loop iterations under the test deadline.
+    let oversized_preview = "x".repeat(SEARCH_OUTPUT_BYTE_BUDGET + 1024);
+    let fake_rg = format!(
+        "#!/bin/sh\nprintf 'src/small.rs:1:needle ok\\n'\nprintf 'src/big.rs:2:{oversized_preview}\\n'\nexit 0\n"
     );
+    write_executable_script(&bin.join("rg"), &fake_rg);
     // Real-head semantics: byte-accurate -n/-c truncation. The restricted PATH
     // contains only this delegating head plus the fake rg.
     write_executable_script(&bin.join("head"), "#!/bin/sh\nexec /usr/bin/head \"$@\"\n");
@@ -3746,6 +3742,35 @@ async fn search_project_text_files_with_matches_is_unique_stable_and_bounded() {
     assert_eq!(result.output["returned_file_count"], 1);
     assert_eq!(result.output["truncated"], true);
     assert_eq!(result.output["truncation_reason"], "limit");
+}
+
+#[tokio::test]
+async fn search_project_text_single_file_count_preserves_filename() {
+    if !host_ripgrep_available() {
+        eprintln!("skipping real-ripgrep integration test: rg is unavailable");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let path = "count file.rs";
+    std::fs::write(tmp.path().join(path), "COUNT_NEEDLE\nCOUNT_NEEDLE\n").unwrap();
+    let runtime = test_runtime();
+    let project =
+        register_runner_project_at_path(&runtime, "single-file-count", "demo", tmp.path()).await;
+    let (result, _) = execute_agent_search(
+        &runtime,
+        "single-file-count",
+        project,
+        SearchRequest {
+            pattern: "COUNT_NEEDLE".to_string(),
+            path: Some(path.to_string()),
+            result_mode: Some(SearchResultMode::Count),
+            ..raw_search_request()
+        },
+    )
+    .await;
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["total_matches"], 2);
+    assert_eq!(result.output["files"][0]["path"], path);
 }
 
 #[tokio::test]
@@ -4805,12 +4830,8 @@ async fn office_artifact_mime_policy_accepts_matching_save_and_upload_paths() {
             .await;
         assert!(!octet.success, "{path}");
         assert!(
-            !octet
-                .error
-                .as_deref()
-                .unwrap()
-                .contains("only allowed for safe artifact extensions"),
-            "Office extensions should be safe octet-stream artifact paths: {:?}",
+            !octet.error.as_deref().unwrap().contains("policy"),
+            "generic binary MIME should pass policy before project resolution: {:?}",
             octet.error
         );
 
@@ -4835,24 +4856,24 @@ async fn office_artifact_mime_policy_accepts_matching_save_and_upload_paths() {
         );
     }
 
-    let unsupported = runtime
+    let unknown_mime = runtime
         .save_project_artifact(
             missing_project,
-            "docs/report.docx".to_string(),
+            "docs/report.customblob".to_string(),
             "YQ==".to_string(),
-            Some("application/msword".to_string()),
+            Some("application/x-unknown".to_string()),
             Some(false),
         )
         .await;
-    assert!(!unsupported.success);
+    assert!(!unknown_mime.success);
     assert!(
-        unsupported
+        !unknown_mime
             .error
             .as_deref()
             .unwrap()
-            .contains("unsupported mime_type"),
-        "{:?}",
-        unsupported.error
+            .contains("mime_type"),
+        "unknown presentation MIME should normalize to generic binary before project resolution: {:?}",
+        unknown_mime.error
     );
 }
 
@@ -4917,12 +4938,8 @@ async fn common_media_artifact_mime_policy_accepts_save_upload_and_octet_paths()
             .await;
         assert!(!octet.success, "{path}");
         assert!(
-            !octet
-                .error
-                .as_deref()
-                .unwrap()
-                .contains("only allowed for safe artifact extensions"),
-            "media extension should be safe for host octet-stream fallback: {:?}",
+            !octet.error.as_deref().unwrap().contains("mime_type"),
+            "generic binary MIME should pass policy before project resolution: {:?}",
             octet.error
         );
     }
@@ -4953,13 +4970,6 @@ async fn artifact_upload_begin_rejects_invalid_inputs_before_resolving_project()
             None,
             Some("text/plain"),
             "expected_bytes too large",
-        ),
-        (
-            "artifacts/imports/raw.bin",
-            Some(1),
-            None,
-            Some("application/octet-stream"),
-            "artifacts/smoke/<name>.artifact",
         ),
     ];
 

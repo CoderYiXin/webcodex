@@ -18,7 +18,36 @@ work_on_project
 ```
 
 `work_on_project` 是普通 coding/review 的 canonical bootstrap。把当前任务 instruction 交给它，然后遵循连接到的 Server 返回的 project instructions 与 tool surface。
-默认情况下，它还会返回一个很小且有界的 `extensions` selection catalog：Skill metadata 来自 canonical 的 project / Runner-configured `skills.roots` / Runner-managed Skill Store 三类来源；Plugin metadata 只包含 configured working directory 与当前 Project root 匹配、且已 ready/committed 的 provider。该 metadata 不授予任何 authority，也不会自动读取 Skill body 或创建 Plugin binding；模型选择后仍需使用 `skill_read_file`，或走 `plugin_tool describe -> call`。只有当前模型上下文仍明确保留这些 discovery metadata 时，才应设置 `include_extension_catalog=false`。
+它的 primary output 默认保持紧凑，不重复静态 instruction/workflow 正文；当前模型上下文缺少这些材料时，分别显式请求 `context_request=["project.instructions"]` 和/或 `context_request=["webcodex.workflow"]`。Workflow Session identity 不证明当前模型仍保留这些上下文。
+Bootstrap 或 discovery 返回 `project_ref` 后，普通 Project-scoped tool call 的 `project` 应优先复用这个短 selector。Canonical `agent:<client_id>:<project_id>` 仍保留用于 diagnostic 与显式 addressing，但模型无需机械重复。`project_ref` 由 Server 持久维护、按 principal 隔离，不携带 authority；每次调用都会根据其钉住的 canonical Project/root identity 重新授权。
+默认情况下，它还会返回一个很小且有界的 `extensions` selection catalog：Skill metadata 来自 canonical 的 project / Runner-configured `skills.roots` / Runner-managed Skill Store 三类来源；Plugin metadata 只包含 configured working directory 与当前 Project root 匹配、且已 ready/committed 的 provider。该 metadata 不授予任何 authority，也不会自动读取 Skill body 或创建 Plugin binding；模型选择后使用 `skill_read_file` 读取 Skill 文本，`run_skill_resource` 只执行可信 Runner-configured live `scripts/` resource（由 `expected_definition_revision` fence definition）或 Runner-installed managed resource（另由 `expected_package_revision` fence package），Plugin 则走 `plugin_tool describe -> call`。Configured resource bytes 会一直保持 live 到实际执行时，并不会预先被 package revision 固定。只有当前模型上下文仍明确保留这些 discovery metadata 时，才应设置 `include_extension_catalog=false`。
+
+## 工具策略 guidance
+
+`work_on_project` 的 `guidance_profile` 默认是 `direct`。Workflow contract v14
+保持共享的 `guidance`、`model_protocol` 和 review `roles`，并在显式
+`context_request=["webcodex.workflow"]` 时通过
+`tool_strategy: {profile, guidance}` 返回本次请求选中的策略。
+
+- `direct`：简单 observation 直接调用最合适的 primitive；预先确定且独立的
+  observations 可以批量执行，模型根据结果顺序决定 adaptive follow-up。
+- `code_mode`：简单单步 observation 仍直接调用；相关 search/read、跨文件定位或
+  综合调查能减少外层模型往返时，优先 read-only Code Mode。在同一个 cell 内顺序
+  完成依赖结果的 follow-up，只并发独立 observations。Raw child results 留在 cell
+  内，先筛选、提取、交叉引用和归纳，再用 `text(...)` 输出下一步决策需要的紧凑证据；
+  避免 `text(results)` 原样倾倒，并在触及 outer-output limit 前主动 projection。
+
+这只是本次请求的 presentation 选择，不增加 admission、权限或 execution semantics，
+不写入 Session。Exact resume 可以重新选择，也不会根据 Window、Session 或历史调用
+猜测。未编译 Experimental Code Mode 时，显式 `code_mode` 被拒绝为无效输入。
+在 `work_on_project` 调用中，`webcodex.workflow` sidecar 使用该次请求的
+`guidance_profile`；其他无 profile context 的普通工具显式请求该 material 时，
+继续使用 canonical default `direct`。
+
+两者共用 scope、recovery、validation truth、Job continuation、review 和 closeout。
+默认仍走 canonical edit 和 structured validation；只有多个相关 validation 或
+adaptive read → one guarded edit 确实减少外层往返时，才考虑相应的 effectful/mutating
+Code Mode。Nested canonical authority、effects、evidence 和 retry certainty 不变。
 
 ## 开始或继续任务
 
@@ -61,6 +90,8 @@ Guard failure 是 **zero-write conflict**，不是削弱 guard 的理由。重�
 
 ## Validation
 
+Formatting 属于收尾，不是每次编辑后的 validation。普通循环是：编辑 → focused validation → 必要时继续编辑 → 源码稳定 → format 一次 → 最终 review/validation。Rust 格式化应在相关源码稳定后、最终 diff/closeout 前执行；只有后续 Rust 编辑可能改变格式时才重跑。`cargo_fmt(check=false)` 用于有意执行最终格式化，`check=true` 用于需要最终只读格式证明的情况。CI/release 格式检查保持不变。
+
 能使用 `cargo_test`、`cargo_check`、`go_test` 等 structured validation 时优先使用它们。先运行能够发现当前回归的最小检查，只有实际受影响的边界需要时才扩大范围。
 
 如果一个确定需要执行的 validation 很可能明显超过 synchronous grace，同时还有真正独立的 read-only inspection，可以显式设置较短的 `sync_wait_secs`（通常可用 `1`），让已经启动的 validation 以**同一个 execution** 尽早 handoff 为 Job。随后只继续独立的源码读取、搜索、diff/architecture inspection 或 review，再观察该 Job；不要为了“并行”额外启动 CPU-heavy validation。如果运行中的 validation 所覆盖源码随后发生 mutation，那么其结果只能算 stale/cache-warmup evidence，不能证明 final workspace；最终源码仍需重新运行 task-appropriate validation。
@@ -79,7 +110,7 @@ Guard failure 是 **zero-write conflict**，不是削弱 guard 的理由。重�
 
 ## 长时间运行的工作
 
-命令或 validation 超过同步等待窗口时，会作为同一条 WebCodex Job 继续执行。保留其精确 Job identity 与 parser-ready continuation；如果仍有有用的独立工作，就先继续这些工作，之后再 observe，不要为了“保持可见”反复轮询 running Job。只有下一步真正依赖 terminal result 时，才使用返回的 `wait_secs=100, wake_on=terminal` 有界等待 continuation。Recovery/continuation hint 不会授权对不确定 effect 做 retry。
+命令或 validation 超过同步等待窗口时，会作为同一条 WebCodex Job 继续执行。保留其精确 Job identity 与 parser-ready continuation；如果仍有有用的独立工作，就先继续这些工作，之后再 observe，不要为了“保持可见”反复轮询 running Job。只有下一步真正依赖 terminal result 时，才使用返回的 host-safe `wait_secs=55, wake_on=terminal` continuation。Runtime 仍接受最长 100 秒的显式 observation wait，但更长的 model-facing wait 可能超过外层 MCP Host deadline。单个 Job 或任一 terminal result 即可推进时使用 `terminal`；预先确定的一组 Job 必须全部结束才能推进时使用 `all_terminal`。Recovery/continuation hint 不会授权对不确定 effect 做 retry。
 
 ## 手动多窗口协作
 

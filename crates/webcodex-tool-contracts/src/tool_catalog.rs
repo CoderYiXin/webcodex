@@ -33,10 +33,13 @@ pub const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
             "project_overview",
             "list_project_tracked_files",
             "read_files",
+            #[cfg(feature = "experimental-code-mode")]
+            "code_mode_exec",
             "run_process",
             "run_script",
             "run_shell",
             "search_project_texts",
+            "search_and_read",
             "document_symbols",
             "document_diagnostics",
             "hover",
@@ -55,26 +58,10 @@ pub const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
             "workspace_checkpoint_list",
             #[cfg(feature = "workspace-checkpoints")]
             "workspace_checkpoint_show",
-            "computer_list_targets",
-            "computer_list_windows",
-            "computer_list_displays",
-            "computer_list_applications",
-            "computer_launch_application",
-            "computer_accessibility_status",
-            "computer_accessibility_tree",
-            "computer_find_elements",
-            "computer_element_state",
-            "computer_activate_window",
+            "browser_observe",
+            "browser_act",
+            "computer_observe",
             "computer_control",
-            "computer_scroll_to_element",
-            "computer_key_input",
-            "computer_read_clipboard",
-            "computer_write_clipboard",
-            "computer_pointer_move",
-            "computer_pointer_click",
-            "computer_input_text",
-            "computer_snapshot",
-            "computer_snapshot_display",
             "computer_save_snapshot",
         ],
     },
@@ -182,6 +169,8 @@ pub const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
             "cargo_check",
             "cargo_test",
             "go_test",
+            #[cfg(feature = "experimental-code-mode")]
+            "code_mode_exec_effectful",
             "validation_summary",
         ],
     },
@@ -197,10 +186,11 @@ pub const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
             "apply_unified_diff",
             "write_project_file",
             "save_project_artifact",
+            #[cfg(feature = "experimental-code-mode")]
+            "code_mode_exec_mutating",
             "read_project_artifact_metadata",
             "read_project_artifact",
             "import_conversation_files_to_project",
-            "export_project_artifact",
             "artifact_upload_begin",
             "artifact_upload_chunk",
             "artifact_upload_finish",
@@ -211,7 +201,8 @@ pub const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
         name: TOOL_DISCOVERY_GROUP_FILE_TRANSFER,
         tools: &[
             "import_conversation_files_to_project",
-            "export_project_artifact",
+            "transfer_project_artifact",
+            "project_artifact",
             "save_project_artifact",
             "read_project_artifact_metadata",
             "read_project_artifact",
@@ -249,6 +240,8 @@ pub const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
             "run_job",
             "stop_job",
             "observe_jobs",
+            "wait_for_job_terminal",
+            "present_job_terminal_continuation",
             "list_jobs",
         ],
     },
@@ -262,6 +255,7 @@ pub const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
             "update_session_context",
             "close_session",
             "post_session_message",
+            "post_peer_message",
             "list_session_messages",
             "get_session_assignment",
             "observe_session_messages",
@@ -285,7 +279,15 @@ pub const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
             "runner_config_check",
             "runner_config_reload",
             "tool_manifest",
+            #[cfg(feature = "experimental-code-mode")]
+            "code_mode_exec",
+            #[cfg(feature = "experimental-code-mode")]
+            "code_mode_exec_effectful",
+            #[cfg(feature = "experimental-code-mode")]
+            "code_mode_exec_mutating",
             "plugin_tool",
+            "skill_load",
+            "run_skill_resource",
             "ssh_resource",
         ],
     },
@@ -339,6 +341,40 @@ pub const TOOL_RECOMMENDED_FLOWS: &[ToolRecommendedFlow] = &[
         ],
     },
     ToolRecommendedFlow {
+        name: "agent_continuation_setup",
+        summary: "New durable Agent window setup: create identity -> create/rotate Endpoint -> present continuation card -> yield/end the current turn -> verify production_auto_resume_available.",
+        manifest_purpose: "Use create_agent_identity, then rotate_agent_continuation_endpoint, then present_agent_continuation. Presentation success is not Host readiness: yield/end the current model turn promptly so the MCP App can mount/bind, then verify the exact Agent through list_agent_identities.production_auto_resume_available. Keep durable Agent identity independent from the Host window.",
+        tools: &[
+            "create_agent_identity",
+            "rotate_agent_continuation_endpoint",
+            "present_agent_continuation",
+            "list_agent_identities",
+        ],
+    },
+    ToolRecommendedFlow {
+        name: "goal_agent_wait_orchestration",
+        summary: "Goal-scoped AgentWait orchestration: ready Coordinator/Workers -> create controlled Goal -> create/associate exact Tasks -> register any|all Wait before workers terminalize -> start Attempt + Endpoint continuation -> on resume bootstrap/consume Wake and reconcile Wait/Goal/Tasks.",
+        manifest_purpose: "For bounded Goal fan-in, keep identities explicit. First establish exact Coordinator/Worker Agents and continuation readiness. Create the Goal with an explicit controller, create exact AgentTasks with explicit workers, and associate each selected Task to that exact Goal. Then call wait_for_agent_events with goal_id plus an explicit 1..8 Task selector list before any selected worker can terminalize; use any for first-result continuation or all for fan-in. Only after registration start each worker with start_agent_task_attempt followed by start_agent_task_endpoint_continuation. On a fresh resumed Coordinator turn bootstrap the exact Wake, consume it immediately, read_agent_wait(wait_id), get_goal(goal_id), re-read every authoritative source Task, and explicitly decide/update Goal state from current durable truth. Never derive the Wait source list from Goal correlations and do not treat this flow as a scheduler, dependency DAG, auto-spawn rule, or automatic Goal progression.",
+        tools: &[
+            "create_agent_identity",
+            "rotate_agent_continuation_endpoint",
+            "present_agent_continuation",
+            "list_agent_identities",
+            "create_goal",
+            "create_agent_task",
+            "associate_goal_agent_task",
+            "wait_for_agent_events",
+            "start_agent_task_attempt",
+            "start_agent_task_endpoint_continuation",
+            "bootstrap_agent_conversation",
+            "consume_agent_wake",
+            "read_agent_wait",
+            "get_goal",
+            "read_agent_task",
+            "update_goal",
+        ],
+    },
+    ToolRecommendedFlow {
         name: "persistent_shell",
         summary: "Persistent shell: primarily reuse one shell for repeated commands on an active named SSH resource and keep remote shell state. New target: ssh_resource list/register -> restart -> list -> bind -> open/reuse. Local persistent shell is only for true same-process state; one-shot SSH uses run_process.",
         manifest_purpose:
@@ -377,6 +413,8 @@ pub const TOOL_RECOMMENDED_FLOWS: &[ToolRecommendedFlow] = &[
         tools: &[
             "search_project_texts",
             "read_files",
+            #[cfg(feature = "experimental-code-mode")]
+            "code_mode_exec",
             "run_process",
             "run_script",
             "run_shell",
@@ -400,18 +438,17 @@ pub const TOOL_RECOMMENDED_FLOWS: &[ToolRecommendedFlow] = &[
     },
     ToolRecommendedFlow {
         name: "file_transfer",
-        summary: "File transfer: host/conversation attachment -> import_conversation_files_to_project; project artifact -> export_project_artifact; caller-held bounded binary -> save_project_artifact/artifact_upload_*; bounded inspection -> read_project_artifact.",
-        manifest_purpose: "Use host-native transfer at the boundary: import_conversation_files_to_project moves current host attachments into a Project without model Base64; export_project_artifact returns an authenticated ResourceLink for complete project-to-host/user transfer. Use save_project_artifact or artifact_upload_* only when bounded binary data is already held by the caller, and read_project_artifact only for bounded inspection.",
+        summary: "File transfer: Host -> import_conversation_files_to_project -> Project; Project -> project_artifact -> Host/model; Project A -> transfer_project_artifact -> Project B. Use metadata for facts, inspect for one bounded segment, image for MCP image delivery, export for complete ResourceLink delivery.",
+        manifest_purpose: "Keep directions explicit: import_conversation_files_to_project is the Host-to-Project write boundary. transfer_project_artifact is the direct Project-to-Project path and streams the exact source bytes/SHA snapshot through Control without Host attachments or model-facing base64. project_artifact is the preferred Project-to-model/host read facade: metadata observes artifact facts, inspect reads one bounded snapshot-fenced segment, image uses supported native MCP image delivery, and export uses an authenticated ResourceLink for complete transfer. Do not loop inspect chunks to transfer a whole file. save_project_artifact/artifact_upload_* remain low-level caller-held binary write primitives.",
         tools: &[
             "import_conversation_files_to_project",
-            "export_project_artifact",
+            "transfer_project_artifact",
+            "project_artifact",
             "save_project_artifact",
             "artifact_upload_begin",
             "artifact_upload_chunk",
             "artifact_upload_finish",
             "artifact_upload_abort",
-            "read_project_artifact_metadata",
-            "read_project_artifact",
         ],
     },
     ToolRecommendedFlow {
@@ -433,31 +470,24 @@ pub const TOOL_RECOMMENDED_FLOWS: &[ToolRecommendedFlow] = &[
         ],
     },
     ToolRecommendedFlow {
+        name: "browser",
+        summary: "Browser/CDP runtime: discover Browser-capable Runners, launch an owned ephemeral Browser, observe pages/semantic snapshots, act only through opaque identities, then re-observe after navigation or uncertain effects.",
+        manifest_purpose: "Use browser_observe for targets/browsers/pages/snapshot/screenshot and browser_act for the closed launch/new_page/navigate/click/input_text/key/close actions. Browser/Page/Element ids are opaque; navigation stales element ids. Never retry an outcome_unknown effect blindly: follow the returned browser_observe reconciliation call.",
+        tools: &["browser_observe", "browser_act"],
+    },
+    ToolRecommendedFlow {
         name: "computer_observe",
-        summary: "Computer observe: discover a caller-visible capable Runner, list its exact windows, then inspect accessibility or capture one exact surface. Read-only; no control actions.",
+        summary: "Computer observe: one guaranteed read-only gateway for Runner/desktop discovery, accessibility inspection, clipboard read, and window/display snapshots. Choose a closed action; no control effects are admitted.",
         manifest_purpose:
-            "Discover a Computer-capable Runner, list its windows, then inspect accessibility or capture one exact surface.",
-        tools: &[
-            "computer_list_targets",
-            "computer_list_windows",
-            "computer_accessibility_status",
-            "computer_accessibility_tree",
-            "computer_find_elements",
-            "computer_element_state",
-            "computer_snapshot",
-        ],
+            "Use computer_observe with the smallest read-only action needed: targets/windows/displays/applications, accessibility_status/accessibility_tree/find_elements/element_state, snapshot_window/snapshot_display, or read_clipboard. Exact action scopes and Runner capabilities remain fenced.",
+        tools: &["computer_observe"],
     },
     ToolRecommendedFlow {
         name: "computer_application_launch",
-        summary: "Computer application launch: discover fresh bounded opaque application IDs, launch exactly one ID, then re-list windows and activate an exact surface only if needed.",
+        summary: "Computer application launch: computer_observe(action=applications), computer_control(action=launch_application), then computer_observe(action=windows) and computer_control(action=activate_window) only if activation is needed.",
         manifest_purpose:
-            "Discover a macOS or Windows application, submit its exact native launch request, then re-observe windows before any follow-up UI effect.",
-        tools: &[
-            "computer_list_applications",
-            "computer_launch_application",
-            "computer_list_windows",
-            "computer_activate_window",
-        ],
+            "Discover a fresh opaque application_id with computer_observe, launch exactly that id through computer_control, then re-observe windows before any follow-up activation/control effect.",
+        tools: &["computer_observe", "computer_control"],
     },
     ToolRecommendedFlow {
         name: "commit",
@@ -480,7 +510,7 @@ pub const TOOL_RECOMMENDED_FLOWS: &[ToolRecommendedFlow] = &[
     },
     ToolRecommendedFlow {
         name: "handoff",
-        summary: "Handoff: use session_summary / session_handoff_summary; coordinator posts a todo, worker reads it once with get_session_assignment, then passes its fence to complete_session_message. Use observe_session_messages only for later generic deltas.",
+        summary: "Handoff/recovery only: use session_summary for lightweight ledger reads. Use session_handoff_summary only for missing task context or explicit transfer, never routine progress polling. Coordinator posts a todo; worker reads it with get_session_assignment and completes with that fence.",
         manifest_purpose: "Coordinate independent Workflow Sessions through atomic assignment snapshots, required assignment-fenced completions, and explicit generic message-state delta observation without sharing execution history, authority, subscriptions, or automatic wake-up.",
         tools: &[
             "session_summary",
@@ -497,76 +527,19 @@ pub const TOOL_RECOMMENDED_FLOWS: &[ToolRecommendedFlow] = &[
     },
 ];
 
-/// Single ordered, unique source of truth for the fixed `local_coding` MCP
-/// compatibility surface. This list intentionally does not drive Adaptive
-/// Runtime intent discovery.
-pub const LOCAL_CODING_TOOL_NAMES: &[&str] = &[
-    // entry
-    "work_on_project",
-    "list_projects",
-    "plugin_tool",
-    // exact coordinator assignment read + atomic completion
-    "get_session_assignment",
-    "complete_session_message",
-    // delegated ACP coding-agent Runs (explicit coding_agent:run authority)
-    "coding_agent_start",
-    "coding_agent_observe",
-    "coding_agent_cancel",
-    // project discovery + read
-    "project_overview",
-    "list_project_tracked_files",
-    "list_project_files",
-    "search_project_texts",
-    "read_files",
-    // LSP navigation
-    "lsp_status",
-    "document_symbols",
-    "document_diagnostics",
-    "hover",
-    "workspace_symbols",
-    "goto_definition",
-    "find_references",
-    "call_hierarchy",
-    // guarded edits
-    "apply_text_edits",
-    "apply_patch",
-    "apply_unified_diff",
-    // structured process, shell semantics/scripts, and jobs
-    "run_process",
-    "run_script",
-    "run_shell",
-    "run_job",
-    "observe_jobs",
-    "list_jobs",
-    "stop_job",
-    // validation
-    "cargo_fmt",
-    "cargo_check",
-    "cargo_test",
-    "go_test",
-    "validation_summary",
-    // git review
-    "git_status",
-    "git_log",
-    "git_review_summary",
-    "git_diff_hunks",
-    "show_changes",
-    "workspace_hygiene_check",
-    // finish
-    "finish_coding_task",
-];
-
-/// Ordered selection surface for ordinary coding work under Adaptive Runtime.
+/// Ordered selection for ordinary coding discovery under Adaptive Runtime.
 ///
-/// This is intentionally smaller and more canonical than the fixed Local Coding
-/// compatibility surface. It may include distinct gateway-routed specialists
-/// that are worth explicit discovery, but excludes singular/legacy peers when a
-/// preferred batch, structured review, or Job-continuation path exists.
+/// This ranks useful capabilities for `tool_manifest(intent="coding")`; it does
+/// not define direct admission. ToolDefinition rank remains the direct SSOT.
 pub const CODING_INTENT_TOOL_NAMES: &[&str] = &[
     "work_on_project",
     "project_overview",
+    "search_and_read",
     "search_project_texts",
     "read_files",
+    "project_artifact",
+    #[cfg(feature = "experimental-code-mode")]
+    "code_mode_exec",
     // Distinct semantic navigation capabilities remain useful even though they
     // are long-tail Adaptive gateway targets.
     "document_symbols",
@@ -579,6 +552,8 @@ pub const CODING_INTENT_TOOL_NAMES: &[&str] = &[
     // Canonical edit plus contextual/multi-hunk specialist.
     "apply_text_edits",
     "apply_patch",
+    #[cfg(feature = "experimental-code-mode")]
+    "code_mode_exec_mutating",
     // Ordinary execution plus program-like multi-stage specialist.
     "run_process",
     "run_script",
@@ -589,6 +564,8 @@ pub const CODING_INTENT_TOOL_NAMES: &[&str] = &[
     "cargo_check",
     "cargo_test",
     "go_test",
+    #[cfg(feature = "experimental-code-mode")]
+    "code_mode_exec_effectful",
     // Worktree and committed-range review.
     "git_review_summary",
     "git_diff_hunks",
@@ -616,6 +593,8 @@ pub const TOOL_MANIFEST_INTENTS: &[ToolManifestIntent] = &[
             "list_project_tracked_files",
             "read_files",
             "search_project_texts",
+            #[cfg(feature = "experimental-code-mode")]
+            "code_mode_exec",
             "list_project_files",
             "git_status",
             "git_log",
@@ -640,6 +619,8 @@ pub const TOOL_MANIFEST_INTENTS: &[ToolManifestIntent] = &[
             "list_project_files",
             "search_project_texts",
             "read_files",
+            #[cfg(feature = "experimental-code-mode")]
+            "code_mode_exec",
             "git_status",
             "git_log",
             "tool_manifest",
@@ -647,17 +628,16 @@ pub const TOOL_MANIFEST_INTENTS: &[ToolManifestIntent] = &[
     },
     ToolManifestIntent {
         name: "file_transfer",
-        purpose: "Move files across the host/Project boundary without routing complete binary payloads through model text.",
+        purpose: "Move files across Host/Project and Project/Project boundaries without routing complete binary payloads through model text.",
         tools: &[
             "import_conversation_files_to_project",
-            "export_project_artifact",
+            "transfer_project_artifact",
+            "project_artifact",
             "save_project_artifact",
             "artifact_upload_begin",
             "artifact_upload_chunk",
             "artifact_upload_finish",
             "artifact_upload_abort",
-            "read_project_artifact_metadata",
-            "read_project_artifact",
         ],
     },
     ToolManifestIntent {

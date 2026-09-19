@@ -137,7 +137,6 @@ async fn runner_disconnect_and_reconnect_change_layers_independently() {
         "server_transport",
         "server_registration",
         "project_registry",
-        "connector_endpoint",
         "last_successful_tool_call",
     ] {
         assert_layer_contract(&connected[name], name);
@@ -155,12 +154,6 @@ async fn runner_disconnect_and_reconnect_change_layers_independently() {
     );
     assert_eq!(connected["server_registration"]["status"], "registered");
     assert_eq!(connected["project_registry"]["status"], "registered");
-    // Connector runtime is not configured in this process.
-    assert_eq!(connected["connector_endpoint"]["status"], "not_configured");
-    assert_eq!(
-        connected["connector_endpoint"]["reason_code"],
-        "connector_runtime_disabled"
-    );
 
     // Disconnect: layers change independently; stale registration is not ready.
     runtime
@@ -217,6 +210,7 @@ async fn runner_disconnect_and_reconnect_change_layers_independently() {
                         command: "echo back".to_string(),
                         session_id: None,
                         timeout_secs: Some(5),
+                        sync_wait_secs: None,
                         cwd: None,
                         purpose: None,
                         shell: None,
@@ -864,11 +858,11 @@ async fn dispatch_coding_call_in_window_with_transport(
                 .await
         }
     });
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + CODING_WORKFLOW_FIXTURE_TIMEOUT;
     while !task.is_finished() {
         assert!(
             std::time::Instant::now() < deadline,
-            "coding workflow did not finish within the 10-second test deadline"
+            "coding workflow did not finish within the {CODING_WORKFLOW_FIXTURE_TIMEOUT:?} test deadline"
         );
         if let Some(req) = runtime
             .runner_registry
@@ -905,8 +899,7 @@ fn coding_start_call(project: &str, instruction: &str) -> ToolCall {
         base_ref: None,
         instruction: instruction.to_string(),
         session_id: None,
-        include_project_instructions: true,
-        include_workflow_guidance: true,
+        guidance_profile: Default::default(),
         include_extension_catalog: false,
     }
 }
@@ -920,8 +913,7 @@ fn coding_resume_call(project: &str, instruction: &str, session_id: &str) -> Too
         base_ref: None,
         instruction: instruction.to_string(),
         session_id: Some(session_id.to_string()),
-        include_project_instructions: true,
-        include_workflow_guidance: true,
+        guidance_profile: Default::default(),
         include_extension_catalog: false,
     }
 }
@@ -1235,7 +1227,9 @@ async fn coding_workflow_read_only_upgrade_is_atomic_and_permission_checked() {
     assert_eq!(upgraded.output["session_id"], session_id);
     assert_eq!(upgraded.output["continuation"], "resumed_explicitly");
     assert_eq!(upgraded.output["instructions"]["status"], "reused");
-    assert_eq!(upgraded.output["instructions"]["content_included"], true);
+    assert!(upgraded.output["instructions"]
+        .get("content_included")
+        .is_none());
     assert!(upgraded.output.get("continuation_feedback").is_none());
     let summary = runtime.sessions.summary(&session_id, Some(20)).unwrap();
     assert!(!summary.guards.deny_write_tools);

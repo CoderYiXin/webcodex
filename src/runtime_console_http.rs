@@ -21,6 +21,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 mod communication;
+mod workspace;
 
 use communication::{
     communication_agent_create, communication_agent_update, communication_agents,
@@ -61,6 +62,22 @@ pub(crate) fn routes() -> Router {
         .push(Router::with_path(api_path(RouteId::RuntimeConsoleWindows)).post(windows))
         .push(Router::with_path(api_path(RouteId::RuntimeConsoleWindow)).post(window))
         .push(Router::with_path(api_path(RouteId::RuntimeConsoleProjects)).post(projects))
+        .push(
+            Router::with_path(api_path(RouteId::RuntimeConsoleExtensions))
+                .post(workspace::extensions),
+        )
+        .push(
+            Router::with_path(api_path(RouteId::RuntimeConsoleInstruction))
+                .post(workspace::instruction),
+        )
+        .push(
+            Router::with_path(api_path(RouteId::RuntimeConsoleProjectGit))
+                .post(workspace::project_git),
+        )
+        .push(
+            Router::with_path(api_path(RouteId::RuntimeConsolePluginReload))
+                .post(workspace::plugin_reload),
+        )
         .push(
             Router::with_path(api_path(RouteId::RuntimeConsoleWorkflowSessions))
                 .post(workflow_sessions),
@@ -304,6 +321,8 @@ struct RuntimeConsoleWindows {
 #[derive(Debug, Clone, Serialize)]
 struct RuntimeConsoleWindowSummary {
     client_window_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_project: Option<String>,
     source: String,
     last_seen_at_ms: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -388,6 +407,9 @@ struct RuntimeConsoleWindowActivity {
     project: Option<String>,
     status: String,
     meaningful: bool,
+    #[cfg(feature = "experimental-code-mode")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code_mode_composition: Option<RuntimeConsoleCodeModeComposition>,
     #[serde(skip_serializing_if = "Option::is_none")]
     recorder_gap_session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -408,6 +430,59 @@ struct RuntimeConsoleWindowActivitySession {
     #[serde(skip_serializing_if = "Option::is_none")]
     project: Option<String>,
     relation: String,
+}
+
+#[cfg(feature = "experimental-code-mode")]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeConsoleCodeModeComposition {
+    nested_calls: usize,
+    nested_successes: usize,
+    nested_failures: usize,
+    max_in_flight: usize,
+    duration_ms: u64,
+    slot_wait_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    input_bytes: Option<usize>,
+    returned_bytes: usize,
+    nested_raw_result_bytes_total: usize,
+    nested_tool_counts: BTreeMap<String, usize>,
+    consequential_calls: usize,
+    known_results: usize,
+    job_handoffs: usize,
+    outcome_unknown: usize,
+}
+
+#[cfg(feature = "experimental-code-mode")]
+fn project_code_mode_composition(value: &Value) -> Option<RuntimeConsoleCodeModeComposition> {
+    let projection =
+        serde_json::from_value::<RuntimeConsoleCodeModeComposition>(value.clone()).ok()?;
+    let counted = projection
+        .nested_tool_counts
+        .values()
+        .try_fold(0usize, |total, value| total.checked_add(*value))?;
+    let consequential_counted = projection
+        .known_results
+        .checked_add(projection.job_handoffs)
+        .and_then(|total| total.checked_add(projection.outcome_unknown))?;
+    if projection.nested_calls > 32
+        || projection.max_in_flight > 8
+        || projection
+            .nested_successes
+            .saturating_add(projection.nested_failures)
+            != projection.nested_calls
+        || counted != projection.nested_calls
+        || consequential_counted != projection.consequential_calls
+        || projection.consequential_calls > projection.nested_calls
+        || projection.nested_tool_counts.len() > 32
+        || projection
+            .nested_tool_counts
+            .keys()
+            .any(|tool| !crate::tool_runtime::code_mode_nested_tool_is_admitted(tool))
+    {
+        return None;
+    }
+    Some(projection)
 }
 
 #[derive(Debug, Serialize)]
@@ -506,6 +581,7 @@ struct RuntimeConsoleRunner {
     projects_returned: usize,
     projects_truncated: bool,
     projects: Vec<RuntimeConsoleRunnerProject>,
+    recent_sessions: RuntimeConsoleRecentSessions,
 }
 
 #[derive(Debug, Serialize)]
@@ -1535,6 +1611,11 @@ async fn project_visible_window_activity(
     event: webcodex_store::models::WindowActivityEventRecord,
     timing: WindowActivityTimingProjection,
 ) -> RuntimeConsoleWindowActivity {
+    #[cfg(feature = "experimental-code-mode")]
+    let code_mode_composition = event
+        .code_mode_composition
+        .as_ref()
+        .and_then(project_code_mode_composition);
     let mut activity_sessions = Vec::new();
     for link in event.workflow_links {
         if !window_project_visible_cached(runtime, auth, visibility_cache, link.project.as_deref())
@@ -1576,6 +1657,8 @@ async fn project_visible_window_activity(
         // Persisted event-time truth: never recompute historical meaningfulness
         // from the current ToolDefinition activity policy.
         meaningful: event.meaningful,
+        #[cfg(feature = "experimental-code-mode")]
+        code_mode_composition,
         recorder_gap_session_id: event.recorder_gap_session_id,
         server_trace_id: event.server_trace_id,
         workflow_sessions: activity_sessions,
@@ -1639,14 +1722,22 @@ async fn visible_window_summary_for_auth(
         .window_activity_db
         .as_ref()
         .ok_or(RuntimeConsoleError::Internal)?;
-    let events = db
-        .list_window_activity_events(window_key, principal, MAX_WINDOW_ACTIVITY_LIMIT)
-        .map_err(|_| RuntimeConsoleError::Internal)?;
+    #[cfg(feature = "experimental-code-mode")]
+    let events = db.list_window_activity_events_with_code_mode_composition(
+        window_key,
+        principal,
+        MAX_WINDOW_ACTIVITY_LIMIT,
+    );
+    #[cfg(not(feature = "experimental-code-mode"))]
+    let events = db.list_window_activity_events(window_key, principal, MAX_WINDOW_ACTIVITY_LIMIT);
+    let events = events.map_err(|_| RuntimeConsoleError::Internal)?;
     let mut source = None;
     let mut last_seen_at_ms = None;
     let mut last_tool_call_at_ms = None;
     let mut last_meaningful_activity_at_ms = None;
     let mut recorder_gap_count = 0usize;
+    let mut last_project = None;
+    let mut project_observed_at = i64::MIN;
     for event in events {
         if !window_event_visible_cached(runtime, auth, visibility_cache, &event).await
             || project_filter.is_some_and(|project| event.project.as_deref() != Some(project))
@@ -1661,6 +1752,10 @@ async fn visible_window_summary_for_auth(
                     .unwrap_or(i64::MIN)
                     .max(event.ended_at_ms),
             );
+        }
+        if event.meaningful && event.project.is_some() && event.ended_at_ms > project_observed_at {
+            last_project = event.project.clone();
+            project_observed_at = event.ended_at_ms;
         }
         if event.meaningful {
             last_meaningful_activity_at_ms = Some(
@@ -1709,6 +1804,10 @@ async fn visible_window_summary_for_auth(
                 .unwrap_or(i64::MIN)
                 .max(request.started_at_ms),
         );
+        if request.project.is_some() && request.started_at_ms > project_observed_at {
+            last_project = request.project.clone();
+            project_observed_at = request.started_at_ms;
+        }
         active_count = active_count.saturating_add(1);
     }
 
@@ -1717,6 +1816,7 @@ async fn visible_window_summary_for_auth(
     };
     Ok(Some(RuntimeConsoleWindowSummary {
         client_window_key: window_key.to_string(),
+        last_project,
         source: source.unwrap_or_default(),
         last_seen_at_ms,
         last_tool_call_at_ms,
@@ -1762,6 +1862,7 @@ async fn windows_for_auth(
                 summary.client_window_key.clone(),
                 RuntimeConsoleWindowSummary {
                     client_window_key: summary.client_window_key,
+                    last_project: None,
                     source: summary.client_window_source,
                     last_seen_at_ms: summary.last_seen_at_ms,
                     last_tool_call_at_ms: summary.last_tool_call_at_ms,
@@ -1787,6 +1888,7 @@ async fn windows_for_auth(
                     live.client_window_key.clone(),
                     RuntimeConsoleWindowSummary {
                         client_window_key: live.client_window_key,
+                        last_project: None,
                         source: live.client_window_source,
                         last_seen_at_ms: summary.last_seen_at_ms.max(live.last_started_at_ms),
                         last_tool_call_at_ms: summary.last_tool_call_at_ms,
@@ -1802,6 +1904,7 @@ async fn windows_for_auth(
                     live.client_window_key.clone(),
                     RuntimeConsoleWindowSummary {
                         client_window_key: live.client_window_key,
+                        last_project: None,
                         source: live.client_window_source,
                         last_seen_at_ms: live.last_started_at_ms,
                         last_tool_call_at_ms: None,
@@ -1861,6 +1964,23 @@ async fn windows_for_auth(
             .then_with(|| left.client_window_key.cmp(&right.client_window_key))
     });
     window_rows.truncate(limit);
+    if auth.is_admin_caller() && project_filter.is_none() {
+        let mut visibility_cache = HashMap::new();
+        for row in &mut window_rows {
+            if let Some(observed) = visible_window_summary_for_auth(
+                runtime,
+                auth,
+                principal_ref,
+                &row.client_window_key,
+                &mut visibility_cache,
+                None,
+            )
+            .await?
+            {
+                row.last_project = observed.last_project;
+            }
+        }
+    }
     let visibility = RuntimeConsoleWindowVisibility {
         scope: if auth.is_admin_caller() {
             RuntimeConsoleWindowVisibilityScope::Global
@@ -1944,9 +2064,19 @@ async fn window_for_auth(
     } else {
         MAX_WINDOW_ACTIVITY_LIMIT
     };
-    let raw_activity = db
-        .list_window_activity_events(&input.client_window_key, principal_ref, activity_scan_limit)
-        .map_err(|_| RuntimeConsoleError::Internal)?;
+    #[cfg(feature = "experimental-code-mode")]
+    let raw_activity = db.list_window_activity_events_with_code_mode_composition(
+        &input.client_window_key,
+        principal_ref,
+        activity_scan_limit,
+    );
+    #[cfg(not(feature = "experimental-code-mode"))]
+    let raw_activity = db.list_window_activity_events(
+        &input.client_window_key,
+        principal_ref,
+        activity_scan_limit,
+    );
+    let raw_activity = raw_activity.map_err(|_| RuntimeConsoleError::Internal)?;
     let raw_activity_at_cap = raw_activity.len() == activity_scan_limit;
     let mut activity_visible = Vec::with_capacity(raw_activity.len());
     for event in &raw_activity {
@@ -2127,9 +2257,15 @@ async fn workflow_session_detail_with_windows(
         if link.recorder_gap_count == 0 {
             continue;
         }
-        let events = db
-            .list_window_activity_events(&link.client_window_key, principal_ref, 32)
-            .map_err(|_| RuntimeConsoleError::Internal)?;
+        #[cfg(feature = "experimental-code-mode")]
+        let events = db.list_window_activity_events_with_code_mode_composition(
+            &link.client_window_key,
+            principal_ref,
+            32,
+        );
+        #[cfg(not(feature = "experimental-code-mode"))]
+        let events = db.list_window_activity_events(&link.client_window_key, principal_ref, 32);
+        let events = events.map_err(|_| RuntimeConsoleError::Internal)?;
         for event in events {
             if event.recorder_gap_session_id.as_deref() != Some(session_id)
                 || event.started_at_ms <= session_updated_at_ms
@@ -2327,6 +2463,8 @@ async fn runner_for_auth(
         .is_some_and(|visible| visible.truncated);
     let running_jobs = running_jobs_for_auth(runtime, auth, None).await?;
     let mut project_summaries = Vec::new();
+    let mut recent_sessions = Vec::new();
+    let mut session_scan_truncated = false;
     for project in visible_projects
         .map(|visible| visible.projects)
         .unwrap_or_default()
@@ -2336,6 +2474,15 @@ async fn runner_for_auth(
         let mut list = runtime
             .workflow_sessions_console_list(&project.id, Some(CONSOLE_AGGREGATE_SESSION_LIMIT));
         apply_running_jobs_to_list(&mut list, &project.id, &running_jobs);
+        session_scan_truncated |= list.truncated;
+        recent_sessions.extend(list.sessions.iter().cloned().map(|session| {
+            RuntimeConsoleRecentSession {
+                client_id: client_id.to_string(),
+                project_id: project.id.clone(),
+                project_name: project.name.clone(),
+                session,
+            }
+        }));
         project_summaries.push(RuntimeConsoleRunnerProject {
             id: project.id,
             name: project.name,
@@ -2346,6 +2493,18 @@ async fn runner_for_auth(
         });
     }
     let projects_returned = project_summaries.len();
+    recent_sessions.sort_by(|a, b| b.session.updated_at.cmp(&a.session.updated_at));
+    let candidate_count = recent_sessions.len();
+    recent_sessions.truncate(50);
+    let recent_sessions = RuntimeConsoleRecentSessions {
+        returned: recent_sessions.len(),
+        candidate_count,
+        truncated: candidate_count > recent_sessions.len(),
+        scan_truncated: session_scan_truncated
+            || visible_projects_truncated
+            || projects_returned < visible_project_count,
+        sessions: recent_sessions,
+    };
     Ok(RuntimeConsoleRunner {
         client_id: client_id.to_string(),
         connected: runner_value
@@ -2371,6 +2530,7 @@ async fn runner_for_auth(
         projects_returned,
         projects_truncated: visible_projects_truncated || projects_returned < visible_project_count,
         projects: project_summaries,
+        recent_sessions,
     })
 }
 
@@ -3091,9 +3251,6 @@ mod tests {
             .hoop(affix_state::inject(config))
             .hoop(affix_state::inject(db))
             .hoop(affix_state::inject(runtime))
-            .hoop(affix_state::inject(
-                crate::connector_runtime::ConnectorRuntimeSlot::default(),
-            ))
             .push(
                 Router::with_path("api")
                     .hoop(crate::AuthMiddleware)
@@ -3112,9 +3269,6 @@ mod tests {
             .hoop(affix_state::inject(config))
             .hoop(affix_state::inject(db))
             .hoop(affix_state::inject(runtime))
-            .hoop(affix_state::inject(
-                crate::connector_runtime::ConnectorRuntimeSlot::default(),
-            ))
             .push(
                 Router::with_path("api")
                     .hoop(crate::AuthMiddleware)
@@ -3137,9 +3291,6 @@ mod tests {
             .hoop(affix_state::inject(config))
             .hoop(affix_state::inject(db))
             .hoop(affix_state::inject(runtime))
-            .hoop(affix_state::inject(
-                crate::connector_runtime::ConnectorRuntimeSlot::default(),
-            ))
             .push(
                 Router::with_path("api")
                     .hoop(crate::AuthMiddleware)
@@ -3813,6 +3964,15 @@ mod tests {
         assert_eq!(home.workflow_sessions.projects_scanned, 2);
         assert!(!home.projects_truncated);
         assert!(!home.recent_sessions.scan_truncated);
+        let runner_view = runner_for_auth(&runtime, &auth, "runner-a", Some(20))
+            .await
+            .unwrap();
+        assert_eq!(runner_view.recent_sessions.sessions.len(), 1);
+        assert_eq!(
+            runner_view.recent_sessions.sessions[0].project_id,
+            "agent:runner-a:proj-a"
+        );
+        assert!(!runner_view.recent_sessions.scan_truncated);
     }
 
     #[tokio::test]
@@ -3838,7 +3998,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hosted_runtime_console_works_without_connector_runtime_and_projects_are_safe() {
+    async fn hosted_runtime_console_uses_ordinary_runtime_and_projects_are_safe() {
         let runtime = test_runtime();
         register_project(
             &runtime,
@@ -3896,6 +4056,31 @@ mod tests {
             .send(&service)
             .await;
         assert_eq!(invalid_query.status_code, Some(StatusCode::BAD_REQUEST));
+    }
+
+    #[tokio::test]
+    async fn product_routes_reject_unknown_effect_selectors_and_invisible_projects() {
+        let (_tmp, service) = hosted_service(test_runtime());
+        for route in ["extensions", "project-git"] {
+            let invalid = TestClient::post(format!("http://localhost/api/runtime-console/{route}"))
+                .json(&serde_json::json!({"project":"agent:missing:project","tool":"run_shell"}))
+                .send(&service)
+                .await;
+            assert_eq!(invalid.status_code, Some(StatusCode::BAD_REQUEST));
+            let hidden = TestClient::post(format!("http://localhost/api/runtime-console/{route}"))
+                .json(&serde_json::json!({"project":"agent:missing:project"}))
+                .send(&service)
+                .await;
+            assert_eq!(hidden.status_code, Some(StatusCode::NOT_FOUND));
+        }
+        let instruction = TestClient::post("http://localhost/api/runtime-console/instruction")
+            .json(&serde_json::json!({"project":"agent:missing:project","source_scope":"runner","path":"/private/secret","fingerprint":"old"}))
+            .send(&service).await;
+        assert_eq!(instruction.status_code, Some(StatusCode::NOT_FOUND));
+        let retarget = TestClient::post("http://localhost/api/runtime-console/plugin-reload")
+            .json(&serde_json::json!({"project":"agent:missing:project","plugin":"provider","runner":"other-runner"}))
+            .send(&service).await;
+        assert_eq!(retarget.status_code, Some(StatusCode::BAD_REQUEST));
     }
 
     #[tokio::test]
@@ -4054,6 +4239,134 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "experimental-code-mode")]
+    #[tokio::test]
+    async fn code_mode_composition_projects_on_one_outer_window_activity() {
+        let (_tmp, db, runtime) = test_runtime_with_window_db();
+        let auth = test_bootstrap_auth();
+        let client_window = crate::client_window::ClientWindow::for_test("code-mode-composition");
+        let (principal_kind, principal_id) =
+            crate::tool_runtime::runtime_observation_principal(Some(&auth)).unwrap();
+        crate::action_audit_sessions::record_action_event(
+            &db,
+            crate::action_audit_sessions::ActionAuditEventInput {
+                explicit_session_id: Some("code-mode-window-audit".to_string()),
+                session_title: None,
+                endpoint: "/mcp".to_string(),
+                action_name: "toolsCall".to_string(),
+                operation: Some("code_mode_exec".to_string()),
+                project: None,
+                principal_kind: None,
+                principal_user_id: None,
+                oauth_client_id: None,
+                status: "success".to_string(),
+                http_status: Some(200),
+                started_at: 1,
+                ended_at: 1,
+                duration_ms: 13,
+                error_summary: None,
+                warning_summary: None,
+                changed_files: Vec::new(),
+                ids: json!({}),
+                summary: json!({
+                    "transport": "mcp",
+                    "code_mode_composition": {
+                        "nested_calls": 3,
+                        "nested_successes": 2,
+                        "nested_failures": 1,
+                        "max_in_flight": 2,
+                        "duration_ms": 11,
+                        "slot_wait_ms": 3,
+                        "returned_bytes": 19,
+                        "nested_raw_result_bytes_total": 31,
+                        "nested_tool_counts": {
+                            "git_status": 1,
+                            "read_files": 1,
+                            "search_project_texts": 1
+                        },
+                        "consequential_calls": 1,
+                        "known_results": 1,
+                        "job_handoffs": 0,
+                        "outcome_unknown": 0
+                    }
+                }),
+                request_bytes: None,
+                response_bytes: None,
+                client_window_key: Some(client_window.key().to_string()),
+                client_window_source: Some("openai-session".to_string()),
+                server_trace_id: Some("trace-code-mode-composition".to_string()),
+                principal_correlation_kind: Some(principal_kind),
+                principal_correlation_id: Some(principal_id),
+                window_started_at_ms: Some(1_000),
+                window_ended_at_ms: Some(1_013),
+                request_observed_at_ms: Some(1_000),
+                response_handed_at_ms: Some(1_013),
+                window_transition_kind: Some("unavailable".to_string()),
+                response_streaming: Some(false),
+                window_continuity_eligible: Some(true),
+                window_meaningful: true,
+                recorder_gap_session_id: None,
+                workflow_links: Vec::new(),
+            },
+        );
+
+        let detail = window_for_auth(
+            &runtime,
+            &auth,
+            WindowInput {
+                client_window_key: client_window.key().to_string(),
+                activity_limit: None,
+                session_limit: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            detail.activity.len(),
+            1,
+            "nested canonical calls must not fabricate Window activity rows"
+        );
+        let activity = &detail.activity[0];
+        assert_eq!(activity.tool_name.as_deref(), Some("code_mode_exec"));
+        assert!(activity.meaningful);
+        let composition = activity
+            .code_mode_composition
+            .as_ref()
+            .expect("bounded Code Mode composition projection");
+        assert_eq!(composition.nested_calls, 3);
+        assert_eq!(composition.nested_successes, 2);
+        assert_eq!(composition.nested_failures, 1);
+        assert_eq!(composition.max_in_flight, 2);
+        assert_eq!(composition.duration_ms, 11);
+        assert_eq!(composition.slot_wait_ms, 3);
+        assert_eq!(composition.returned_bytes, 19);
+        assert_eq!(composition.nested_raw_result_bytes_total, 31);
+        assert_eq!(composition.nested_tool_counts.len(), 3);
+        assert_eq!(composition.consequential_calls, 1);
+        assert_eq!(composition.known_results, 1);
+        assert_eq!(composition.job_handoffs, 0);
+        assert_eq!(composition.outcome_unknown, 0);
+
+        let invalid = json!({
+            "nested_calls": 1,
+            "nested_successes": 1,
+            "nested_failures": 0,
+            "max_in_flight": 1,
+            "duration_ms": 1,
+            "slot_wait_ms": 0,
+            "returned_bytes": 1,
+            "nested_raw_result_bytes_total": 1,
+            "nested_tool_counts": {"run_shell": 1},
+            "consequential_calls": 0,
+            "known_results": 0,
+            "job_handoffs": 0,
+            "outcome_unknown": 0
+        });
+        assert!(project_code_mode_composition(&invalid).is_none());
+        let events = db.list_action_events("code-mode-window-audit", 10).unwrap();
+        assert_eq!(events.len(), 1);
+    }
+
     #[tokio::test]
     async fn window_activity_counts_all_visible_requests_before_bounding_details() {
         let (_tmp, _db, runtime) = test_runtime_with_window_db();
@@ -4159,6 +4472,11 @@ mod tests {
         assert_eq!(filtered.total, 1);
         assert_eq!(filtered.returned, 1);
         assert_eq!(filtered.windows[0].client_window_key, window_a);
+        assert_eq!(filtered.windows[0].last_project.as_deref(), Some(project_a));
+        assert!(all
+            .windows
+            .iter()
+            .any(|row| row.last_project.as_deref() == Some(project_b)));
         assert_eq!(
             filtered.windows[0].last_meaningful_activity_at_ms,
             Some(1_001)
@@ -5009,24 +5327,24 @@ mod tests {
             .unwrap_err(),
             RuntimeConsoleError::NotFound
         );
-        assert_eq!(
-            session_post_message_for_auth(
-                &runtime,
-                &auth_a,
-                WorkflowSessionPostMessageInput {
-                    project: project_id.to_string(),
-                    session_id: session.session_id.clone(),
-                    kind: SessionMessageKind::Note,
-                    priority: SessionMessagePriority::High,
-                    message: "invalid ack mode".to_string(),
-                    reply_to: None,
-                    requires_ack: true,
-                },
-            )
-            .await
-            .unwrap_err(),
-            RuntimeConsoleError::Invalid
-        );
+        let ack_required_note = session_post_message_for_auth(
+            &runtime,
+            &auth_a,
+            WorkflowSessionPostMessageInput {
+                project: project_id.to_string(),
+                session_id: session.session_id.clone(),
+                kind: SessionMessageKind::Note,
+                priority: SessionMessagePriority::High,
+                message: "ack-required note".to_string(),
+                reply_to: None,
+                requires_ack: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(ack_required_note.kind, "note");
+        assert_eq!(ack_required_note.priority, "high");
+        assert!(ack_required_note.requires_ack);
         assert_eq!(
             session_post_message_for_auth(
                 &runtime,

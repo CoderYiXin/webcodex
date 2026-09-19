@@ -61,6 +61,10 @@ baseline rather than redesigned by the next authoring work:
 - `plugins/repo-info` is the first read-only authoring-loop dogfood Plugin. Its
   single `git_summary` tool accepts no path and observes only the provider-configured
   `cwd`, keeping repository selection in Runner configuration rather than Plugin input.
+- `plugins/campus-application` is a Browser-oriented planning Plugin. It consumes
+  bounded semantic snapshots, maps them to a Runner-local structured resume profile,
+  and emits bounded fill/section/step plans while leaving Browser authority and final
+  submission outside the Plugin.
 
 This produces one important ownership rule:
 
@@ -319,6 +323,14 @@ A higher-level TypeScript control/extension runtime, if later needed for Skills,
 Memory, orchestration, or integrations, is also a separate architectural layer.
 It may consume canonical WebCodex primitives, but Native Tool Plugins should not
 silently evolve into that runtime.
+
+The Experimental Code Mode E1.x work now provides a concrete reason to preserve
+that distinction. Its root-side `CanonicalOrchestrationHost` re-enters canonical
+`ToolRuntime` with exact outer authority while the V8 adapter is only a frontend.
+That host/frontend split is a possible substrate for a future tested TypeScript
+composition layer, but it does **not** change the Native Plugin protocol today.
+Native Plugins remain one-way capability providers over `initialize` / `tools/list`
+/ `tools/call`; they do not receive a recursive ToolRuntime callback channel.
 
 ## Explicit non-goals for the authoring workflow
 

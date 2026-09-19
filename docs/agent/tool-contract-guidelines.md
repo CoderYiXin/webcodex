@@ -68,7 +68,12 @@ to be needed, tightly related, and an existing primitive naturally supports the
 batch. Examples include several related `read_files` ranges, independent search
 queries, or a short bounded `run_shell` chain of predetermined observations.
 Result-dependent follow-ups stay sequential so the next call can incorporate the
-new evidence. Do not preload unrelated data or combine permission, mutation,
+new evidence. In direct strategy the model chooses each follow-up across calls;
+with explicitly selected Code Mode guidance, an admitted read-only cell can inspect
+results and perform dependent follow-ups sequentially inside the same cell. Only
+independent observations run concurrently. Keep intermediate child results inside
+the cell and project compact decision evidence before `text(...)`; batching raw
+results into one output does not save model context. Do not preload unrelated data or combine permission, mutation,
 validation, commit, publish, deploy, or restart boundaries merely to reduce call
 count.
 
@@ -130,6 +135,12 @@ During active development, a cleaner canonical tool shape is preferred over
 preserving an unused historical shape. Durable persisted truth, mixed-version
 Server/Runner protocol, published artifacts, and named external consumers are
 separate compatibility domains and must be handled explicitly.
+
+### Project selectors: canonical identity, short model reference
+
+Runtime Project identity remains canonical as `agent:<client_id>:<project_id>`. Keep that form for authorization, persistence, audit, Runner routing, diagnostics and explicit API/CLI addressing. A Server-issued `project_ref` is a model-facing selector only: the Server owns a durable mapping scoped to the authenticated caller and pins it to one canonical Project incarnation, including stable root identity. The model may reuse the short ref across windows for the same principal, but no Workflow Session, ClientWindow, MCP session, transport connection, recent activity or Host rewrite participates.
+
+Resolving a `project_ref` must always look up the pinned canonical identity and then run the ordinary current Project resolution/authorization path again. The ref is not a credential, bearer token or capability. If the canonical Project disappears, becomes invisible, loses stable identity, or the same canonical address is later registered for a different root, the old ref fails closed. Never recycle or silently retarget an issued ref. Discovery/bootstrap may expose both `project_ref` and canonical identity; ordinary hot-path results should not repeat them when no model decision depends on that duplication.
 
 ### Model-projection deletion test
 
@@ -218,8 +229,8 @@ secondary to the tool result.
 This is a presentation/projection rule, not permission to weaken the underlying
 protocol. In particular:
 
-- missing Context ACK may return explicit recovery guidance;
-- the Host must not invent or automatically inject an ACK on WebCodex's behalf;
+- missing task context is recovered explicitly with `session_handoff_summary`;
+- collaboration ACKs require request-scoped retained-message proof;
 - a ClientWindow must not select a Workflow Session;
 - support metadata must not become execution authority.
 
@@ -245,7 +256,7 @@ Keep these concepts distinct:
 - **refine** — issue a new observation with changed bounded parameters, such as a
   larger result or hunk limit;
 - **recovery** — repair a failed/lost/invalid state using domain-proven evidence;
-- **checkpoint/ACK** — model-context coherence; not a cursor and not authority.
+- **collaboration ACK** — request-scoped retained-message proof; not a cursor or authority.
 
 Do not advertise a continuation that cannot recover the omitted information. Do
 not turn `outcome_unknown` into retry permission. Do not create a universal cursor

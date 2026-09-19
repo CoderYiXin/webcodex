@@ -18,8 +18,6 @@ const frontendRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repositoryRoot = resolve(frontendRoot, "..");
 const buildScript = resolve(frontendRoot, "scripts/build.mjs");
 const requiredAssets = [
-  "console.html",
-  "app.js",
   "workflow_session_state.js",
   "runtime_collaboration_state.js",
   "runtime_communication_state.js",
@@ -37,10 +35,14 @@ const requiredAssets = [
   "runtime_operations.js",
   "runtime_navigation.js",
   "runtime_collaboration.js",
+  "runtime_product_view.js",
+  "runtime_product.js",
+  "runtime_window_state.js",
+  "runtime_sessions.js",
+  "runtime_workspace.js",
   "runtime.html",
   "runtime.js",
   "runtime.css",
-  "styles.css",
   "admin.html",
   "admin.js",
   "admin.css",
@@ -70,26 +72,11 @@ async function assertRequiredAssets(outputDirectory) {
   for (const asset of requiredAssets) {
     assert.equal((await stat(resolve(outputDirectory, asset))).isFile(), true);
   }
-  const app = await readFile(resolve(outputDirectory, "app.js"), "utf8");
-  assert.equal(app.includes("interface Review"), false);
-  assert.equal(/\.innerHTML\b|\binnerHTML\s*=/.test(app), false);
-  assert.match(app, /workflow-session/);
-  assert.match(app, /textContent/);
-  assert.match(app, /workflow-session-overview-validation/);
-  assert.match(app, /workflow-session-overview-progress/);
-  const consoleHtml = await readFile(resolve(outputDirectory, "console.html"), "utf8");
-  assert.match(consoleHtml, /workflow-session-overview-work/);
-  assert.match(consoleHtml, /Reported progress/);
-  assert.match(consoleHtml, /Model-reported; informational only\./);
-  assert.match(consoleHtml, /WebCodex — Project Review Console/);
-  assert.match(consoleHtml, /Project review console/);
   const runtimeHtml = await readFile(resolve(outputDirectory, "runtime.html"), "utf8");
-  assert.match(runtimeHtml, /WebCodex Runtime Console/);
-  assert.match(runtimeHtml, /runtime-device-select/);
-  assert.match(runtimeHtml, /runtime-project-list/);
+  assert.match(runtimeHtml, /WebCodex — Workspace/);
+  assert.match(runtimeHtml, /runtime-global-sessions/);
+  assert.match(runtimeHtml, /runtime-projects-content/);
   assert.equal(runtimeHtml.includes("runtime-project-" + "select"), false);
-  assert.match(runtimeHtml, /runtime-project-search/);
-  assert.match(runtimeHtml, /runtime-project-search[^>]*maxlength="200"/);
   assert.match(runtimeHtml, /runtime-collaboration-form/);
   assert.match(runtimeHtml, /id="runtime-chat-scroll" class="chat-scroll"/);
   assert.match(runtimeHtml, /id="runtime-message-body" rows="1" maxlength="4000" enterkeyhint="send"/);
@@ -134,6 +121,8 @@ async function assertRequiredAssets(outputDirectory) {
   assert.match(runtimeHtml, /Reported progress/);
   assert.match(runtimeHtml, /Model-reported; informational only\./);
   const runtime = await readFile(resolve(outputDirectory, "runtime.js"), "utf8");
+  assert.match(runtime, /product-project-query/);
+  assert.match(runtime, /search.maxLength = 200/);
   assert.match(runtime, /\/api\/runtime-console\//);
   assert.match(runtime, /runtimeDeviceIds/);
   assert.match(runtime, /runtimeProjectsForDevice/);
@@ -187,11 +176,9 @@ async function assertRequiredAssets(outputDirectory) {
   assert.match(runtime, /syncResponsiveNavigation/);
   assert.equal(/\.innerHTML\b|\binnerHTML\s*=/.test(runtime), false);
   await exec(process.execPath, ["--check", resolve(outputDirectory, "runtime.js")]);
-  const styles = await readFile(resolve(outputDirectory, "styles.css"), "utf8");
-  assert.match(styles, /workflow-session-summary-runtime/);
   const runtimeStyles = await readFile(resolve(outputDirectory, "runtime.css"), "utf8");
   assert.match(runtimeStyles, /max-width:\s*900px/);
-  assert.match(runtimeStyles, /min-width:\s*1280px/);
+  assert.match(runtimeStyles, /min-width:\s*1600px/);
   assert.match(runtimeStyles, /safe-area-inset-bottom/);
   assert.match(runtimeStyles, /safe-area-inset-top/);
   assert.match(runtimeStyles, /prefers-reduced-motion/);
@@ -240,7 +227,6 @@ async function assertRequiredAssets(outputDirectory) {
   assert.match(runtimeStyles, /session-state-chips \.chip:not\(:last-child\)\{display:none/);
   assert.match(runtimeStyles, /message-card\.message-group-continuation \.message-author\{display:none/);
   assert.match(runtimeStyles, /context-navigation/);
-  await exec(process.execPath, ["--check", resolve(outputDirectory, "app.js")]);
   const admin = await readFile(resolve(outputDirectory, "admin.js"), "utf8");
   await exec(process.execPath, ["--check", resolve(outputDirectory, "admin.js")]);
   assert.equal(/localStorage|sessionStorage|document\.cookie/.test(admin), false);
@@ -251,11 +237,7 @@ async function assertRequiredAssets(outputDirectory) {
 async function copySources(sourceDirectory) {
   await mkdir(sourceDirectory, { recursive: true });
   for (const source of [
-    "app.ts",
-    "review_state.ts",
     "workflow_session_state.ts",
-    "styles.css",
-    "console.html",
     "runtime.ts",
     "runtime_collaboration_state.ts",
     "runtime_communication_state.ts",
@@ -273,6 +255,11 @@ async function copySources(sourceDirectory) {
     "runtime_operations.ts",
     "runtime_navigation.ts",
     "runtime_collaboration.ts",
+    "runtime_product_view.ts",
+    "runtime_product.ts",
+    "runtime_window_state.ts",
+  "runtime_sessions.ts",
+    "runtime_workspace.ts",
     "runtime.css",
     "runtime.html",
     "admin.ts",
@@ -299,7 +286,7 @@ async function waitFor(predicate, diagnostic, timeoutMs = 10_000) {
   throw new Error(diagnostic());
 }
 
-test("custom development build creates parseable fixed console assets", async () => {
+test("custom development build creates parseable runtime and admin assets", async () => {
   const outputDirectory = await mkdtemp(resolve(tmpdir(), "webcodex-assets-"));
   try {
     const result = await exec(process.execPath, [
@@ -351,27 +338,27 @@ test(
       );
       await assertRequiredAssets(outputDirectory);
 
-      const changedCss = "body { color: rgb(1, 2, 3); }\n";
-      await writeFile(resolve(sourceDirectory, "styles.css"), changedCss);
+      const changedCss = ".runtime { color: rgb(1, 2, 3); }\n";
+      await writeFile(resolve(sourceDirectory, "runtime.css"), changedCss);
       await waitFor(
         async () =>
-          (await readFile(resolve(outputDirectory, "styles.css"), "utf8")).includes(
+          (await readFile(resolve(outputDirectory, "runtime.css"), "utf8")).includes(
             "rgb(1,2,3)"
           ),
         () => `watcher did not rebuild CSS: ${stdout}\n${stderr}`
       );
 
-      const lastGoodApp = await readFile(resolve(outputDirectory, "app.js"), "utf8");
-      await writeFile(resolve(sourceDirectory, "app.ts"), "const broken: = 1;\n");
+      const lastGoodRuntime = await readFile(resolve(outputDirectory, "runtime.js"), "utf8");
+      await writeFile(resolve(sourceDirectory, "runtime.ts"), "const broken: = 1;\n");
       await waitFor(
         () => stderr.includes("[console] build failed:"),
         () => `watcher did not report the failed build: ${stdout}\n${stderr}`
       );
       assert.equal(
-        await readFile(resolve(outputDirectory, "app.js"), "utf8"),
-        lastGoodApp
+        await readFile(resolve(outputDirectory, "runtime.js"), "utf8"),
+        lastGoodRuntime
       );
-      await exec(process.execPath, ["--check", resolve(outputDirectory, "app.js")]);
+      await exec(process.execPath, ["--check", resolve(outputDirectory, "runtime.js")]);
     } finally {
       child.kill("SIGTERM");
       await new Promise((resolvePromise) => child.once("exit", resolvePromise));
@@ -383,7 +370,7 @@ test(
 test("development output is ignored by Git", async () => {
   await exec(
     "git",
-    ["check-ignore", "--quiet", "frontend/.dev-dist/app.js"],
+    ["check-ignore", "--quiet", "frontend/.dev-dist/runtime.js"],
     { cwd: repositoryRoot }
   );
 });

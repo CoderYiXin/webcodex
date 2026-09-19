@@ -34,7 +34,7 @@ fn computer_action_audit_projection_omits_sensitive_observation_payloads() {
         "total_count": 1,
         "truncated": false
     });
-    let targets_audit = action_audit_output_for_tool("computer_list_targets", &targets_output);
+    let targets_audit = action_audit_output_for_tool("computer_observe", &targets_output);
     assert_eq!(
         targets_audit,
         serde_json::json!({"count": 1, "total_count": 1, "truncated": false})
@@ -56,7 +56,7 @@ fn computer_action_audit_projection_omits_sensitive_observation_payloads() {
         "count": 1,
         "truncated": false
     });
-    let list_audit = action_audit_output_for_tool("computer_list_windows", &list_output);
+    let list_audit = action_audit_output_for_tool("computer_observe", &list_output);
     assert_eq!(
         list_audit,
         serde_json::json!({"count": 1, "truncated": false})
@@ -82,7 +82,7 @@ fn computer_action_audit_projection_omits_sensitive_observation_payloads() {
         "file_bytes": 12345,
         "content_base64": "SUPER_SECRET_SCREENSHOT_BYTES"
     });
-    let snapshot_audit = action_audit_output_for_tool("computer_snapshot", &snapshot_output);
+    let snapshot_audit = action_audit_output_for_tool("computer_observe", &snapshot_output);
     let snapshot_serialized = serde_json::to_string(&snapshot_audit).unwrap();
     assert_eq!(snapshot_audit["surface_id"], "surface_safe");
     assert_eq!(snapshot_audit["width"], 900);
@@ -101,7 +101,7 @@ fn computer_action_audit_projection_omits_sensitive_observation_payloads() {
         "text": "REST_AUDIT_SECRET",
         "value": "REST_AUDIT_SECRET"
     });
-    let text_audit = action_audit_output_for_tool("computer_input_text", &text_output);
+    let text_audit = action_audit_output_for_tool("computer_control", &text_output);
     let text_serialized = serde_json::to_string(&text_audit).unwrap();
     assert_eq!(text_audit["surface_id"], "surface_safe");
     assert_eq!(text_audit["element_id"], "element_safe");
@@ -2162,7 +2162,6 @@ async fn gpt_action_direct_and_gateway_admission_fail_closed() {
     for tool in [
         "present_goal_plan",
         "present_agent_continuation",
-        "export_project_artifact",
         "definitely_not_a_tool",
     ] {
         let (status, body, _) = oauth_action_call(&service, "secret", tool, json!({})).await;
@@ -2229,6 +2228,62 @@ async fn gpt_action_direct_and_gateway_admission_fail_closed() {
             .unwrap_or("")
             .contains("not available through GPT Actions"));
     }
+}
+
+#[tokio::test]
+async fn gpt_action_suggested_call_projection_preserves_canonical_generic_result() {
+    let (_tmp, service) = phase2_service();
+    let root = tempfile::tempdir().unwrap();
+    let status = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(root.path())
+        .status()
+        .expect("git init");
+    assert!(status.success());
+    let path = root
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let arguments = json!({
+        "client_id": "missing-493-action-runner",
+        "path": path,
+        "instruction": "recover the unknown Runner"
+    });
+
+    let (_status, canonical) = http_tool_call(
+        &service,
+        json!({"tool": "work_on_project", "params": arguments.clone()}),
+    )
+    .await;
+    assert_eq!(canonical["success"], false, "{canonical}");
+    assert_eq!(
+        canonical["output"]["suggested_call"]["tool"],
+        "list_runners"
+    );
+
+    let (status, projected, _) =
+        oauth_action_call(&service, "secret", "work_on_project", arguments).await;
+    assert_ne!(status, StatusCode::NOT_FOUND, "{projected}");
+    assert_eq!(projected["success"], false, "{projected}");
+    let suggested = &projected["output"]["suggested_call"];
+    assert_eq!(suggested["tool"], "call_runtime_tool");
+    assert_eq!(suggested["arguments"]["tool"], "list_runners");
+    assert_eq!(
+        suggested["arguments"]["arguments"],
+        json!({"include_projects": false, "summary_only": true})
+    );
+
+    let (status, recovery, _) = oauth_action_call(
+        &service,
+        "secret",
+        suggested["tool"].as_str().unwrap(),
+        suggested["arguments"].clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{recovery}");
+    assert_eq!(recovery["success"], true, "{recovery}");
 }
 
 #[tokio::test]

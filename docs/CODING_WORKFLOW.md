@@ -18,7 +18,7 @@ work_on_project
 ```
 
 `work_on_project` is the canonical bootstrap for normal coding and review. Give it the current task instruction and then follow the project instructions and tools returned by the connected Server.
-By default it also returns a small bounded `extensions` catalog for selection: Skill metadata comes from the canonical project/configured/managed Skill union, and Plugin metadata is restricted to ready providers whose configured working directory matches the Project root. This metadata grants no authority and does not load Skill bodies or create Plugin bindings; use `skill_read_file` or `plugin_tool describe -> call` only after selecting a relevant entry. Set `include_extension_catalog=false` only when the current model context already retains that discovery metadata.
+By default it also returns a small bounded `extensions` catalog for selection: Skill metadata comes from the canonical project/configured/managed Skill union, and Plugin metadata is restricted to ready providers whose configured working directory matches the Project root. This metadata grants no authority and does not load Skill bodies or create Plugin bindings; use `skill_read_file` for Skill text, `run_skill_resource` only for trusted Runner-configured live `scripts/` resources guarded by `expected_definition_revision` or Runner-installed managed resources additionally fenced by `expected_package_revision`, or `plugin_tool describe -> call` after selecting a relevant entry. Configured resource bytes remain live until execution rather than being package-revision-pinned. Set `include_extension_catalog=false` only when the current model context already retains that discovery metadata.
 
 ## Start or continue a task
 
@@ -48,7 +48,42 @@ Guidance is delivered in tool results; it is not the client's system prompt and
 does not grant execution authority. Host instructions, the user's task,
 applicable project rules, authentication, and runtime safety policy still apply.
 Delivery is not proof that a model read, retained, or followed the guidance.
-Keep guidance enabled unless the current model context already retains it.
+`work_on_project` keeps its primary result compact: request static model-facing
+material only when the current model context needs it, using
+`context_request=["project.instructions"]` and/or
+`context_request=["webcodex.workflow"]`. Workflow Session identity never proves
+that the current model retained either material.
+
+When bootstrap or discovery returns `project_ref`, reuse it as the `project` selector on ordinary Project-scoped calls. The canonical `agent:<client_id>:<project_id>` identity remains visible for diagnostics and explicit addressing, but the model does not need to mechanically repeat it. A short ref is Server-owned, durable and principal-scoped, carries no authority, and is reauthorized against its pinned canonical Project/root identity on every call.
+
+## Tool strategy guidance
+
+`work_on_project` accepts `guidance_profile`, defaulting to `direct`. Workflow
+contract v14 returns shared `guidance`, `model_protocol` and review `roles`, plus
+only the selected `tool_strategy: {profile, guidance}`, when explicitly requested
+through `context_request=["webcodex.workflow"]`. The selection is request-local:
+choose again on exact resume without changing Session identity or business state.
+It is never inferred from a Window, Session or past tool use, and grants no tools,
+admission, authority or execution semantics. Builds without Experimental Code Mode
+reject explicit `code_mode` as an invalid profile. On a `work_on_project` call the
+workflow sidecar uses that call's `guidance_profile`; unrelated tools that request
+`webcodex.workflow` use the canonical default `direct` profile.
+
+- `direct`: use the simplest sufficient primitive; batch predetermined independent
+  observations and let the model inspect results before adaptive follow-up calls.
+- `code_mode`: still use a direct primitive for one simple observation. Prefer
+  read-only orchestration when related search/read work, cross-file investigation
+  or synthesis saves outer model turns. Keep dependent follow-ups sequential inside
+  one cell; parallelize only independent observations. Keep raw child results in
+  the cell, filter and synthesize them, then emit compact decision evidence through
+  `text(...)`. Avoid `text(results)` dumps and project before reaching output limits.
+
+Both strategies retain bounded targeted reads, narrow discovery, first-class native
+commands/structured tools, and the same recovery, authority, review and closeout.
+Canonical edits and structured validators remain the default. Effectful composition
+is useful only when related validations save outer turns; guarded mutation composition
+is useful only when adaptive read -> one guarded edit benefits. Nested canonical
+permissions, effects, validation evidence, Jobs and retry certainty remain unchanged.
 
 ## Inspect before editing
 
@@ -74,6 +109,8 @@ The exact matching metadata and transactional protocol are maintainer details; s
 
 ## Validation
 
+Formatting is finalization, not per-edit validation. The normal loop is edit → focused validation → further edits if needed → source stabilizes → format once → final review/validation. For Rust, run formatting after relevant source stabilizes and before final diff/closeout; rerun only after later Rust edits that can change formatting. Use `cargo_fmt(check=false)` for intentional final formatting and `check=true` when read-only final formatting proof is needed. CI and release formatting gates remain unchanged.
+
 Prefer structured validation such as `cargo_test`, `cargo_check`, or `go_test` when available. Use the smallest check that can detect the regression, and broaden only when the affected boundary requires it.
 
 When a required validation is likely to outlast its synchronous grace and independent read-only inspection remains, set a short `sync_wait_secs` (often `1`) so that already-started validation hands off as the **same execution** Job. Continue only independent reads, search, diff/architecture inspection, or review, then observe that Job. Do not start extra CPU-heavy validations merely for parallelism. If source covered by the running validation changes afterward, its result is stale/cache-warmup evidence rather than proof of the final workspace; run task-appropriate validation again on the final source.
@@ -92,7 +129,7 @@ Review the actual workspace/diff after editing and validation. Passing tests do 
 
 ## Long-running work
 
-A command or validation that outlives the synchronous grace period continues as the same WebCodex Job. Keep its exact Job identity and parser-ready continuation. If useful independent work remains, continue that work and observe the Job later; do not repeatedly poll a running Job merely to keep it visible. When the next useful action actually depends on the terminal result, use the provided bounded `wait_secs=100, wake_on=terminal` continuation. Recovery/continuation hints never authorize a retry of an uncertain effect.
+A command or validation that outlives the synchronous grace period continues as the same WebCodex Job. Keep its exact Job identity and parser-ready continuation. If useful independent work remains, continue that work and observe the Job later; do not repeatedly poll a running Job merely to keep it visible. When the next useful action actually depends on the terminal result, use the provided host-safe `wait_secs=55, wake_on=terminal` continuation. The Runtime still accepts explicit observation waits up to 100 seconds, but longer model-facing waits can exceed an outer MCP Host deadline. For one Job or when any terminal result unblocks progress, use `terminal`; when every Job in a predetermined set is required before progress, use `all_terminal`. Recovery/continuation hints never authorize a retry of an uncertain effect.
 
 ## Manual multi-window collaboration
 

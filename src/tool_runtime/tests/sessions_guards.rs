@@ -562,7 +562,7 @@ async fn read_only_session_allows_read_files_and_records_success() {
             include_workspace: Some(false),
             include_checkpoints: Some(false),
             include_validation: Some(false),
-            summary_only: false,
+            diagnostic: true,
             limit: None,
         })
         .await;
@@ -800,6 +800,7 @@ async fn read_only_session_rejects_run_shell_before_agent_enqueue() {
                 command: "echo should-not-run".to_string(),
                 session_id: Some(session.session_id.clone()),
                 timeout_secs: Some(30),
+                sync_wait_secs: None,
                 cwd: None,
                 purpose: None,
                 shell: None,
@@ -925,6 +926,7 @@ async fn deny_write_only_allows_read_and_shell_tools() {
                         command: "exit 0".to_string(),
                         session_id: Some(session_id),
                         timeout_secs: Some(30),
+                        sync_wait_secs: Some(30),
                         cwd: None,
                         purpose: None,
                         shell: None,
@@ -972,6 +974,7 @@ async fn deny_shell_only_allows_write_tools() {
                 command: "echo blocked".to_string(),
                 session_id: Some(session.session_id.clone()),
                 timeout_secs: Some(30),
+                sync_wait_secs: None,
                 cwd: None,
                 purpose: None,
                 shell: None,
@@ -1100,11 +1103,11 @@ fn project_tool_schemas_include_optional_session_id() {
         );
         assert_eq!(
             session_hint["properties"]["attention_reason"]["enum"],
-            json!(["high_priority_guidance_requires_ack"])
+            json!(["session_message_requires_ack"])
         );
         assert_eq!(
             session_hint["properties"]["attention_instruction"]["enum"],
-            json!(["High-priority Session guidance is pending. Read session_discussion_summary before continuing."])
+            json!(["A Session message requiring acknowledgement is pending. Read session_discussion_summary before continuing."])
         );
         for optional in [
             "attention_required",

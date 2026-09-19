@@ -393,6 +393,78 @@ async fn read_files_returns_ordered_normalized_successes_after_out_of_order_comp
 }
 
 #[tokio::test]
+async fn read_files_coalescing_falls_back_when_merged_range_crosses_byte_ceiling() {
+    use webcodex_workspace::file_read_range::{read_range_from, EffectiveRange, ReadFileReason};
+
+    let line = format!("{}\n", "x".repeat(600));
+    let content = line.repeat(360);
+    assert!(read_range_from(content.as_bytes(), EffectiveRange::new(Some(1), Some(180))).is_ok());
+    assert!(read_range_from(
+        content.as_bytes(),
+        EffectiveRange::new(Some(181), Some(180))
+    )
+    .is_ok());
+    let merged_error =
+        read_range_from(content.as_bytes(), EffectiveRange::new(Some(1), Some(360))).unwrap_err();
+    assert_eq!(merged_error.reason, ReadFileReason::RangeTooLarge);
+
+    let root = tempfile::tempdir().unwrap();
+    let runtime = ToolRuntime::new_for_tests();
+    let client_id = "coalesced-range-byte-fallback";
+    register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
+
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .read_files(
+                    "demo".to_string(),
+                    vec![
+                        item("src/lib.rs", Some(1), Some(180)),
+                        item("src/lib.rs", Some(181), Some(180)),
+                    ],
+                    Some(false),
+                )
+                .await
+        }
+    });
+
+    let merged = next_read_request(&runtime, client_id).await;
+    assert_eq!(merged.start_line, Some(1));
+    assert_eq!(merged.end_line, Some(360));
+    complete_patch_agent_request(
+        &runtime,
+        client_id,
+        &merged.request_id,
+        1,
+        "",
+        "read_file failed: range_too_large",
+    )
+    .await;
+
+    let first = next_read_request(&runtime, client_id).await;
+    assert_eq!(first.start_line, Some(1));
+    assert_eq!(first.end_line, Some(180));
+    complete_read(&runtime, client_id, &first, &content).await;
+
+    let second = next_read_request(&runtime, client_id).await;
+    assert_eq!(second.start_line, Some(181));
+    assert_eq!(second.end_line, Some(360));
+    complete_read(&runtime, client_id, &second, &content).await;
+
+    let result = task.await.unwrap();
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["succeeded_count"], 2);
+    assert_eq!(result.output["failed_count"], 0);
+    assert_eq!(result.output["items"][0]["output"]["returned_lines"], 180);
+    assert_eq!(result.output["items"][1]["output"]["returned_lines"], 180);
+    assert_eq!(
+        result.output["items"][0]["output"]["sha256"],
+        result.output["items"][1]["output"]["sha256"]
+    );
+}
+
+#[tokio::test]
 async fn read_files_reuses_read_revision_for_same_full_file_snapshot_across_ranges() {
     let root = tempfile::tempdir().unwrap();
     let runtime = ToolRuntime::new_for_tests();
@@ -1489,9 +1561,7 @@ async fn read_files_records_one_outer_session_event_and_keeps_metadata_outer_onl
 
 #[tokio::test]
 async fn read_files_direct_session_overlay_pressure_keeps_final_response_under_hard_cap() {
-    use crate::tool_runtime::sessions::{
-        SessionContextRevisionAck, SessionTransport, ToolCallRecorderMetadata,
-    };
+    use crate::tool_runtime::sessions::{SessionTransport, ToolCallRecorderMetadata};
     use webcodex_core::runtime_contract::MODEL_INSPECTION_MAX_RESULT_BYTES as MAX_SERIALIZED_OUTPUT_BYTES;
 
     let root = tempfile::tempdir().unwrap();
@@ -1501,10 +1571,7 @@ async fn read_files_direct_session_overlay_pressure_keeps_final_response_under_h
     let session = runtime
         .sessions
         .start_session(Some(project.clone()), Some("direct final cap".to_string()));
-    assert_eq!(
-        seed_model_facing_recovery_events(&runtime, &session.session_id, &project, 20),
-        20
-    );
+    seed_recovery_events(&runtime, &session.session_id, &project, 20);
     let auth = auth_context(None, true);
 
     let task = tokio::spawn({
@@ -1530,7 +1597,6 @@ async fn read_files_direct_session_overlay_pressure_keeps_final_response_under_h
                     Some(&auth),
                     SessionTransport::Mcp,
                     ToolCallRecorderMetadata {
-                        ack_session_context_revision: SessionContextRevisionAck::Revision(0),
                         ..Default::default()
                     },
                 )
@@ -1561,7 +1627,6 @@ async fn read_files_outer_recording_session_preserves_complete_sparse_shape() {
         HostFileImportTrust, ToolCallContext, ToolCallRequest, ToolInvocationMetadata,
         ToolProtocolCapabilities, ToolTransport,
     };
-    use crate::tool_runtime::sessions::SessionContextRevisionAck;
 
     let root = tempfile::tempdir().unwrap();
     let runtime = ToolRuntime::new_for_tests();
@@ -1596,11 +1661,9 @@ async fn read_files_outer_recording_session_preserves_complete_sparse_shape() {
                         host_file_import_trust: HostFileImportTrust::Untrusted,
                     },
                     ToolInvocationMetadata {
-                        ack_session_context_revision: SessionContextRevisionAck::Revision(0),
                         ..Default::default()
                     },
                     ToolProtocolCapabilities {
-                        context_continuity: true,
                         context_sidecar: true,
                         ..Default::default()
                     },
@@ -1619,10 +1682,6 @@ async fn read_files_outer_recording_session_preserves_complete_sparse_shape() {
     assert!(result.output.get("session_context_revision").is_none());
     assert!(result.output.get("session_continuity").is_none());
     assert!(result.output.get("session_recovery").is_none());
-    assert_eq!(
-        runtime.sessions.context_revision(&session.session_id),
-        Some(0)
-    );
     for omitted in [
         "project",
         "requested_count",
@@ -1742,8 +1801,7 @@ async fn read_files_ignores_context_ack_and_preserves_bounded_attention() {
         ToolProtocolCapabilities, ToolTransport,
     };
     use crate::tool_runtime::sessions::{
-        PostSessionMessageInput, SessionContextRevisionAck, SessionMessageKind,
-        SessionMessagePriority,
+        PostSessionMessageInput, SessionMessageKind, SessionMessagePriority,
     };
     use webcodex_workspace::file_read_range::MAX_SERIALIZED_OUTPUT_BYTES;
 
@@ -1755,14 +1813,8 @@ async fn read_files_ignores_context_ack_and_preserves_bounded_attention() {
         Some(project.clone()),
         Some("bounded recovery overlays".to_string()),
     );
-    assert_eq!(
-        seed_model_facing_recovery_events(&runtime, &session.session_id, &project, 50),
-        50
-    );
-    assert_eq!(
-        seed_large_changed_path_recovery_events(&runtime, &session.session_id, &project, 50,),
-        100
-    );
+    seed_recovery_events(&runtime, &session.session_id, &project, 50);
+    seed_large_changed_path_events(&runtime, &session.session_id, &project, 50);
     for kind in [
         SessionMessageKind::Guidance,
         SessionMessageKind::Question,
@@ -1816,9 +1868,11 @@ async fn read_files_ignores_context_ack_and_preserves_bounded_attention() {
         "purpose": "test",
         "assertion_name": assertion_name,
     });
-    let (_, recorder_metadata) =
-        ToolCall::from_tool_name_with_recorder_metadata("run_process", validation_request.clone())
-            .unwrap();
+    let (_, recorder_metadata) = crate::tool_runtime::parse_tool_call_with_recorder_metadata(
+        "run_process",
+        validation_request.clone(),
+    )
+    .unwrap();
     let audited = crate::tool_runtime::tool_audit::session_log_arguments_for_tool_request(
         "run_process",
         &validation_request,
@@ -1875,11 +1929,10 @@ async fn read_files_ignores_context_ack_and_preserves_bounded_attention() {
                     },
                     ToolInvocationMetadata {
                         context_request: vec!["webcodex.workflow".to_string()],
-                        ack_session_context_revision: SessionContextRevisionAck::Revision(0),
+
                         ..Default::default()
                     },
                     ToolProtocolCapabilities {
-                        context_continuity: true,
                         context_sidecar: true,
                         ..Default::default()
                     },
@@ -1927,7 +1980,6 @@ async fn read_files_outer_recording_session_keeps_final_response_under_hard_cap(
         HostFileImportTrust, ToolCallContext, ToolCallRequest, ToolInvocationMetadata,
         ToolProtocolCapabilities, ToolTransport,
     };
-    use crate::tool_runtime::sessions::SessionContextRevisionAck;
     use webcodex_core::runtime_contract::MODEL_INSPECTION_MAX_RESULT_BYTES as MAX_SERIALIZED_OUTPUT_BYTES;
 
     let root = tempfile::tempdir().unwrap();
@@ -1938,10 +1990,7 @@ async fn read_files_outer_recording_session_keeps_final_response_under_hard_cap(
         Some(project.clone()),
         Some("final response cap".to_string()),
     );
-    assert_eq!(
-        seed_model_facing_recovery_events(&runtime, &session.session_id, &project, 20),
-        20
-    );
+    seed_recovery_events(&runtime, &session.session_id, &project, 20);
     let auth = auth_context(None, true);
     let arguments = json!({
         "project": project,
@@ -1974,11 +2023,9 @@ async fn read_files_outer_recording_session_keeps_final_response_under_hard_cap(
                         host_file_import_trust: HostFileImportTrust::Untrusted,
                     },
                     ToolInvocationMetadata {
-                        ack_session_context_revision: SessionContextRevisionAck::Revision(0),
                         ..Default::default()
                     },
                     ToolProtocolCapabilities {
-                        context_continuity: true,
                         context_sidecar: true,
                         ..Default::default()
                     },

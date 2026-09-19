@@ -17,13 +17,14 @@ use crate::runner_protocol::{
     ShellJobValidationProgress, ShellJobValidationStep, JOB_INVENTORY_MAX_TERMINAL_JOBS,
 };
 use crate::tool_runtime::sessions::{SessionTransport, DEFAULT_MAX_EVENTS_PER_SESSION};
+use crate::tool_runtime::structured_execution::STRUCTURED_EXECUTION_SYNC_WAIT_SECS;
 use crate::tool_runtime::validation_events::validation_summary_for_session;
 use crate::tool_runtime::{ObserveJobsItem, ObserveJobsWakeOn, ToolCall, ToolRuntime};
 use serde_json::json;
 
 /// Fetch the `start_validation_job` request that the agent should have polled
 /// and return the job id embedded in it.
-async fn poll_start_validation_job(
+pub(super) async fn poll_start_validation_job(
     runtime: &ToolRuntime,
     client_id: &str,
 ) -> (crate::runner_protocol::RunnerRequest, String) {
@@ -100,7 +101,7 @@ async fn complete_sync_shell_lifecycle(
         .unwrap();
 }
 
-fn cargo_test_update(
+pub(super) fn cargo_test_update(
     client_id: &str,
     request_id: &str,
     job_id: &str,
@@ -147,7 +148,7 @@ fn cargo_test_update(
     }
 }
 
-fn running_progress(step: &str) -> ShellJobValidationProgress {
+pub(super) fn running_progress(step: &str) -> ShellJobValidationProgress {
     ShellJobValidationProgress {
         completed: 0,
         current_step: Some(step.to_string()),
@@ -155,7 +156,7 @@ fn running_progress(step: &str) -> ShellJobValidationProgress {
     }
 }
 
-fn completed_progress() -> ShellJobValidationProgress {
+pub(super) fn completed_progress() -> ShellJobValidationProgress {
     ShellJobValidationProgress {
         completed: 1,
         current_step: None,
@@ -209,6 +210,7 @@ async fn seed_retained_terminal_validation_job(
                 shell: Some("bash".to_string()),
                 validation_steps: vec![step.clone()],
                 validation: Some(ShellJobValidationMetadata {
+                    source_fence: None,
                     tool: "cargo_check".to_string(),
                     kind: "check".to_string(),
                     steps: vec![step],
@@ -815,7 +817,7 @@ async fn fast_cargo_check_completes_in_windows_and_leaves_no_visible_job() {
 }
 
 #[tokio::test]
-async fn long_cargo_check_hands_off_with_immediately_observable_token() {
+async fn default_cargo_check_handoff_preserves_same_execution_through_terminal() {
     let client_id = "vhandoff-long-check";
     let runtime = runtime_with_agent_project(client_id)
         .with_validation_sync_wait(std::time::Duration::from_millis(20));
@@ -846,7 +848,7 @@ async fn long_cargo_check_hands_off_with_immediately_observable_token() {
                     None,
                     None,
                     Some(600),
-                    Some(1),
+                    None,
                     None,
                     None,
                     None,
@@ -874,7 +876,14 @@ async fn long_cargo_check_hands_off_with_immediately_observable_token() {
     let result = task.await.unwrap();
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["promoted_to_job"], true);
-    assert_eq!(result.output["sync_wait_secs"], 1);
+    assert_eq!(
+        result.output["sync_wait_secs"],
+        STRUCTURED_EXECUTION_SYNC_WAIT_SECS
+    );
+    assert_eq!(result.output["execution_state"], "running");
+    assert_eq!(result.output["command_started"], true);
+    assert_eq!(result.output["command_completed"], false);
+    assert_eq!(result.output["terminal"], false);
     assert!(result.output["stdout_tail"]
         .as_str()
         .is_some_and(|tail| tail.contains("Checking demo v0.1.0")));
@@ -899,6 +908,11 @@ async fn long_cargo_check_hands_off_with_immediately_observable_token() {
         })
     );
     assert_eq!(result.output["job_id"], job_id);
+    assert_eq!(result.output["continuation"]["tool"], "observe_jobs");
+    assert_eq!(
+        result.output["continuation"]["arguments"]["items"][0]["job_id"],
+        job_id
+    );
     let observation_token = result.output["observation_token"]
         .as_str()
         .expect("cargo_check handoff observation token")
@@ -928,6 +942,163 @@ async fn long_cargo_check_hands_off_with_immediately_observable_token() {
             .as_str()
             .expect("observed cargo_check observation token"),
     );
+    assert!(
+        probe_patch_agent_request(&runtime, client_id)
+            .await
+            .is_none(),
+        "handoff must not enqueue a replacement validation"
+    );
+
+    runtime
+        .runner_registry
+        .update_job(cargo_test_update(
+            client_id,
+            &request.request_id,
+            &job_id,
+            "completed",
+            "Finished `dev` profile [unoptimized + debuginfo] target(s)\n",
+            "",
+            Some(0),
+            completed_progress(),
+            true,
+        ))
+        .await
+        .unwrap();
+    let terminal = runtime
+        .job_status_for_auth(job_id.clone(), false, None)
+        .await;
+    assert!(terminal.success, "{:?}", terminal.error);
+    assert_eq!(terminal.output["job_id"], job_id);
+    assert_eq!(terminal.output["status"], "completed");
+    assert_eq!(terminal.output["terminal"], true);
+    assert!(
+        probe_patch_agent_request(&runtime, client_id)
+            .await
+            .is_none(),
+        "terminal completion must remain the original execution"
+    );
+}
+
+#[tokio::test]
+async fn default_validation_handoff_beats_host_like_observation_deadline() {
+    let client_id = "vhandoff-host-like-deadline";
+    // Scale the production early-handoff grace down for deterministic CI. The
+    // model-facing budget still reports the canonical default; only this test's
+    // runtime wait cap is shortened.
+    let runtime = runtime_with_agent_project(client_id)
+        .with_validation_sync_wait(std::time::Duration::from_millis(20));
+    register_agent(
+        &runtime,
+        client_id,
+        None,
+        RunnerCapabilities {
+            async_shell_jobs: true,
+            structured_validation_argv: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let project = agent_test_project_id(client_id);
+
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        async move {
+            runtime
+                .cargo_check_with_context(
+                    project,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(600),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+        }
+    });
+    let (request, job_id) = poll_start_validation_job(&runtime, client_id).await;
+    runtime
+        .runner_registry
+        .update_job(cargo_test_update(
+            client_id,
+            &request.request_id,
+            &job_id,
+            "running",
+            "Checking host-fence v0.1.0\n",
+            "",
+            None,
+            running_progress("check"),
+            false,
+        ))
+        .await
+        .unwrap();
+
+    // The caller observation fence is deliberately longer than the test-scaled
+    // handoff grace but shorter than simulated validation completion.
+    let completion = tokio::spawn({
+        let runtime = runtime.clone();
+        let request_id = request.request_id.clone();
+        let job_id = job_id.clone();
+        async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+            runtime
+                .runner_registry
+                .update_job(cargo_test_update(
+                    client_id,
+                    &request_id,
+                    &job_id,
+                    "completed",
+                    "Finished host-fence check\n",
+                    "",
+                    Some(0),
+                    completed_progress(),
+                    true,
+                ))
+                .await
+                .unwrap();
+        }
+    });
+    let handoff = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+        .await
+        .expect("default handoff must return before the caller observation deadline")
+        .unwrap();
+    assert!(handoff.success, "{:?}", handoff.error);
+    assert_eq!(handoff.output["promoted_to_job"], true);
+    assert_eq!(
+        handoff.output["sync_wait_secs"],
+        STRUCTURED_EXECUTION_SYNC_WAIT_SECS
+    );
+    assert_eq!(handoff.output["job_id"], job_id);
+    assert_eq!(handoff.output["execution_state"], "running");
+    assert_eq!(handoff.output["command_started"], true);
+    assert_eq!(handoff.output["command_completed"], false);
+    assert_eq!(handoff.output["terminal"], false);
+    assert_eq!(handoff.output["continuation"]["tool"], "observe_jobs");
+    assert_eq!(
+        handoff.output["continuation"]["arguments"]["items"][0]["job_id"],
+        job_id
+    );
+    assert!(
+        probe_patch_agent_request(&runtime, client_id)
+            .await
+            .is_none(),
+        "deadline-safe handoff must not redispatch validation"
+    );
+
+    completion.await.unwrap();
+    let terminal = runtime
+        .job_status_for_auth(job_id.clone(), false, None)
+        .await;
+    assert!(terminal.success, "{:?}", terminal.error);
+    assert_eq!(terminal.output["job_id"], job_id);
+    assert_eq!(terminal.output["status"], "completed");
+    assert_eq!(terminal.output["terminal"], true);
 }
 
 /// Auto handoff: a validation still running when the injected sync window
@@ -1010,10 +1181,22 @@ async fn long_cargo_test_hands_off_to_queryable_job() {
     assert_eq!(result.output["command_started"], true);
     assert_eq!(result.output["command_completed"], false);
     assert_eq!(result.output["effective_timeout_secs"], 1800);
-    assert_eq!(result.output["sync_wait_secs"], 60);
+    assert_eq!(
+        result.output["sync_wait_secs"],
+        STRUCTURED_EXECUTION_SYNC_WAIT_SECS
+    );
     assert!(result.output.get("passed").is_none());
     assert!(result.output.get("failure_kind").is_none());
     assert_eq!(result.output["job_id"].as_str().unwrap(), job_id.as_str());
+    assert_eq!(result.output["terminal"], false);
+    assert_eq!(result.output["continuation"]["tool"], "observe_jobs");
+    assert_eq!(
+        result.output["continuation"]["arguments"]["items"][0]["job_id"],
+        job_id
+    );
+    assert!(result.output["continuation"]["arguments"]["items"][0]
+        .get("after_observation_token")
+        .is_some());
     let observation_token = result.output["observation_token"]
         .as_str()
         .expect("cargo_test handoff observation token")
@@ -1321,6 +1504,156 @@ async fn handoff_job_terminal_success_produces_passed_validation_summary() {
         latest["tests_run_count"],
         status.output["validation"]["tests_run_count"]
     );
+}
+
+#[tokio::test]
+async fn e3_cargo_test_lib_handoff_arms_terminal_attention_without_polling() {
+    let client_id = "vhandoff-e3-attention";
+    let temp = tempfile::tempdir().unwrap();
+    let db = std::sync::Arc::new(
+        crate::Database::open(&temp.path().join("e3-validation-handoff.db")).unwrap(),
+    );
+    let controller =
+        crate::job_terminal_attention::JobTerminalContinuationController::new(db.clone());
+    let registry = std::sync::Arc::new(
+        crate::job_receipts::production_registry_with_terminal_attention(
+            db.clone(),
+            controller.clone(),
+        )
+        .await,
+    );
+    let runtime = ToolRuntime::new(
+        registry,
+        std::sync::Arc::new(crate::tool_runtime::RuntimeInfo::default()),
+    )
+    .with_job_terminal_attention(db.clone(), controller)
+    .with_validation_sync_wait(std::time::Duration::from_millis(50));
+    register_agent(
+        &runtime,
+        client_id,
+        None,
+        RunnerCapabilities {
+            async_shell_jobs: true,
+            structured_validation_argv: true,
+            structured_cargo_test_lib: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let project = agent_test_project_id(client_id);
+    let auth = auth_context(None, true);
+
+    let validation = tokio::spawn({
+        let runtime = runtime.clone();
+        let auth = auth.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(
+                    ToolCall::CargoTest {
+                        project,
+                        session_id: None,
+                        cwd: None,
+                        filter: None,
+                        lib: Some(true),
+                        all_targets: None,
+                        all_features: None,
+                        no_default_features: None,
+                        features: None,
+                        package: None,
+                        no_run: None,
+                        require_tests: None,
+                        min_tests: None,
+                        timeout_secs: Some(1800),
+                        sync_wait_secs: Some(1),
+                    },
+                    Some(&auth),
+                )
+                .await
+        }
+    });
+    let (request, job_id) = poll_start_validation_job(&runtime, client_id).await;
+    runtime
+        .runner_registry
+        .update_job(cargo_test_update(
+            client_id,
+            &request.request_id,
+            &job_id,
+            "running",
+            "running 1 test\n",
+            "",
+            None,
+            running_progress("test"),
+            false,
+        ))
+        .await
+        .unwrap();
+    let handoff = validation.await.unwrap();
+    assert!(handoff.success, "{:?}", handoff.error);
+    let _handoff_token = sparse_validation_handoff_token(&handoff.output, &job_id);
+
+    let armed = runtime
+        .dispatch_with_auth(
+            ToolCall::WaitForJobTerminal {
+                job_id: job_id.clone(),
+                idempotency_key: "e3-cargo-test-lib-attention".to_string(),
+            },
+            Some(&auth),
+        )
+        .await;
+    assert!(armed.success, "{:?}", armed.error);
+    assert_eq!(armed.output["state"], "waiting");
+    assert_eq!(armed.output["automatic_resume_available"], false);
+
+    runtime
+        .runner_registry
+        .update_job(cargo_test_update(
+            client_id,
+            &request.request_id,
+            &job_id,
+            "completed",
+            "running 1 test\n\ntest result: ok. 1 passed; 0 failed; 0 ignored\n",
+            "",
+            Some(0),
+            completed_progress(),
+            true,
+        ))
+        .await
+        .unwrap();
+
+    let principal = crate::job_terminal_attention::principal_for_auth(Some(&auth));
+    let wait_id = armed.output["wait_id"].as_str().unwrap();
+    let triggered = db
+        .read_job_terminal_wait(&principal, wait_id, chrono::Utc::now().timestamp())
+        .unwrap();
+    assert_eq!(
+        triggered.state,
+        webcodex_store::JobTerminalWaitState::Triggered
+    );
+    assert_eq!(
+        triggered.delivery_state,
+        webcodex_store::JobTerminalDeliveryState::Pending
+    );
+    assert_eq!(triggered.terminal_status.as_deref(), Some("completed"));
+    assert_eq!(triggered.terminal_outcome.as_deref(), Some("succeeded"));
+
+    // Terminal visibility did not require observation. One explicit observation is
+    // still available afterward when the model wants canonical logs/details.
+    let details = runtime
+        .dispatch_with_auth(
+            ToolCall::ObserveJobs {
+                items: vec![ObserveJobsItem {
+                    job_id: job_id.clone(),
+                    after_observation_token: None,
+                }],
+                tail_lines: 40,
+                wait_secs: None,
+                wake_on: ObserveJobsWakeOn::Terminal,
+            },
+            Some(&auth),
+        )
+        .await;
+    assert!(details.success, "{:?}", details.error);
+    assert_eq!(details.output["terminal_count"], 1);
 }
 
 #[tokio::test]
@@ -2858,7 +3191,7 @@ fn cargo_output_schema_enforces_handoff_terminal_and_rejection_branches() {
                         "job_id": "job-123",
                         "after_observation_token": "observation"
                     }],
-                    "wait_secs": 100,
+                    "wait_secs": webcodex_core::runtime_contract::MODEL_JOB_CONTINUATION_WAIT_SECS,
                     "wake_on": "terminal"
                 }
             },

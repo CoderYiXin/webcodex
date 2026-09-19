@@ -581,6 +581,8 @@ impl RunnerRegistry {
                 &runner_instance_id,
                 auth_group,
                 self.observation_epoch.clone(),
+                self.inner.capture_candidates(),
+                self.inner.capture_terminal_event_candidates(),
                 inventory,
                 now,
             );
@@ -1488,6 +1490,7 @@ impl RunnerRegistry {
         let view = Self::runner_view_locked(inner, client_id)?;
         Some(RunnerSemanticView {
             view,
+            observed_at: std::time::Instant::now(),
             runner_features,
         })
     }

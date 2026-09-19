@@ -364,7 +364,8 @@ Client enrollment generates the Runner config. Important settings in
 | `transport` | Prefer `auto` with `[quic]` configured. |
 | `project_registry_dir` | Directory of project registry files. |
 | `[policy]` | Local execution boundary (`allowed_roots`, etc.). |
-| `[skills].roots` | Optional absolute Runner-local read-only Skill roots; live files are discovered without copying into the managed Skill Store. |
+| `[skills].roots` | Optional absolute Runner-local live Skill roots. WebCodex does not modify them; supported scripts may execute via `run_skill_resource`; content is not copied into the managed Skill Store. |
+| `[instructions].files` | Optional absolute Runner-local instruction files applied to every Project on this Runner. No implicit default path; the list is hot-reloadable and file contents are live. |
 | `[shell]` | Optional shell profile definitions and bounded persistent-shell limits. |
 | `[ssh.resources.<name>]` | Optional named SSH target for Session-bound `run_shell` / `run_job`. |
 
@@ -391,6 +392,15 @@ until restart. Unix service reload/SIGHUP remains a compatibility trigger for th
 same reload primitive, but is not required for first-class config control. Identity,
 server/auth, project source, concurrency, capabilities, and transport changes
 remain restart-only where reported.
+
+`[instructions].files` is explicitly hot-reloadable: after check/reload, new
+Project bootstraps use the new list without Runner restart. Changing the contents
+of an already-configured instruction file needs no config reload at all; the next
+bootstrap re-reads it. These configured instruction paths do not widen
+`[policy].allowed_roots` or ordinary Project filesystem authority, and native
+absolute paths are not exposed in startup projection. The current manual
+`runner.toml` configuration is Runner-level and applies to every Project on that
+Runner; Desktop selection/upload UI is future work.
 
 `[plugins]` is live-reloadable: generic Runner config reload and `plugin_tool reload`
 share the same Plugin candidate admission/atomic-commit primitive. Plugin provider
@@ -443,7 +453,7 @@ curl -fsS -X POST https://your-domain.example/api/oauth/clients/create \
 
 `allowed_scopes` limits what an OAuth client may request. Existing clients are not silently widened when WebCodex adds new permissions. To change an existing client, submit the complete desired non-empty allow-list to `POST /api/oauth/clients/update_scopes`. A real change invalidates the client's old OAuth grants and requires reauthorization; submitting the same canonical list is a no-op. See [Authentication](AUTH_MODEL.md#oauth2) for the security model.
 
-If ChatGPT MCP host-file import is enabled, configure the exact server-generated OAuth client id in `WEBCODEX_OAUTH2_TRUSTED_MCP_FILE_CLIENT_IDS`. Reprovisioning the client creates a new id, so update this setting as part of that explicit trust rotation. Client display names and redirect URIs are not substitutes for the configured client id.
+ChatGPT MCP host-file import uses two trust tiers. An active authenticated OAuth client may import only from `files.oaiusercontent.com` or its subdomains; those URLs still require HTTPS, public DNS resolution with address pinning, port 443, no userinfo, no redirects, and the normal bounded download/write policy. Configure an exact server-generated OAuth client id in `WEBCODEX_OAUTH2_TRUSTED_MCP_FILE_CLIENT_IDS` only when that client must also import from arbitrary public HTTPS hosts under the same SSRF controls. Reprovisioning changes the client id but does not break ordinary OpenAI-host attachment import; update the setting to restore the broader Tier 1 trust. Client display names and redirect URIs never grant Tier 1 trust.
 
 A separate local-only exception exists for an operator-controlled Server that is
 bound to loopback and reached through OpenAI Secure Tunnel with a locally
@@ -475,8 +485,8 @@ for compatibility but are not part of the new model-facing schema.
 
 Both integrations enter the same ToolRuntime authority path. GPT Actions does not
 introduce a separate scope, Project-authority, permission, Runner-capability, or
-retry policy. Project-bound Connector deployments keep their independent canonical
-fourteen-capability MCP/OpenAPI surface.
+retry policy. Project-scoped `share`/`run` deployments expose the same ordinary
+Adaptive Runtime while ProjectGrant visibility keeps them bound to their Project.
 
 See [GPT Actions](GPT_ACTIONS.md), [MCP](MCP.md), and [AI Onboarding](AI_ONBOARDING.md).
 
@@ -491,7 +501,7 @@ auto-execute or require human approval:
 | --- | --- |
 | unset / empty | `trusted_agent` (default for self-hosted single-operator deployments). |
 | `trusted_agent` | Project work, shell, jobs, git, and validation auto-execute after hard safety checks, with no approval interruptions. Push/tag/publish/release/deploy still require an explicit user task action. |
-| `restricted` | Consequential tools are denied unless a human approves them (`webcodex task approve/deny`). |
+| `restricted` | Consequential runtime tools are denied by permission policy. There is no separate Connector command-approval queue. |
 
 Hard safety boundaries (project roots, read-only sessions, path policy,
 credential redaction, job cancel semantics) are never relaxed by
@@ -527,14 +537,13 @@ Recommended production smoke sequence:
 
 ### Runtime console
 
-The Server serves a host-local browser console at `/console`. It shows project
-readiness, the work queue, Workflow Session activity, visible Runners, and recent
-mutating activity. For Connector tasks, the same host-local human can send task
-guidance, decide pending approvals, cancel work, and Accept or Reject a stable
-result. These actions use the same authority boundaries as the CLI; the online
-model still cannot accept its own work. The console also shows non-secret client
-connection targets, with ChatGPT Developer Mode MCP custom apps as the primary
-ChatGPT path. Credentials are deliberately never returned by the console API.
+The Server serves the Runtime Console at `/runtime`. It projects ordinary runtime,
+Project, Runner, Job, Workflow Session, collaboration, and recent activity state
+through the same authorization path used by ToolRuntime. Project-scoped credentials
+see only their ProjectGrant-visible Runner/Project set; knowing another Project or
+Runner id does not widen visibility. The old Connector Project Review Console at
+`/console` and its task/result/approval APIs are removed. Credentials are never
+returned by the Runtime Console API.
 
 ### Runtime job API trust model
 

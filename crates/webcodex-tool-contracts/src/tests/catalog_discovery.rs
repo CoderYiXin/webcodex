@@ -154,6 +154,107 @@ fn tool_recommended_flows_reference_visible_defined_tools() {
 }
 
 #[test]
+fn agent_continuation_setup_flow_is_focused_and_keeps_resume_tools_separate() {
+    let flow = TOOL_RECOMMENDED_FLOWS
+        .iter()
+        .find(|flow| flow.name == "agent_continuation_setup")
+        .expect("agent_continuation_setup recommended flow");
+    assert_eq!(
+        flow.tools,
+        &[
+            "create_agent_identity",
+            "rotate_agent_continuation_endpoint",
+            "present_agent_continuation",
+            "list_agent_identities",
+        ]
+    );
+    let guidance = format!("{}\n{}", flow.summary, flow.manifest_purpose).to_lowercase();
+    for phrase in [
+        "new durable agent window setup",
+        "yield/end",
+        "production_auto_resume_available",
+        "presentation success is not host readiness",
+    ] {
+        assert!(
+            guidance.contains(phrase),
+            "setup flow should mention {phrase}: {guidance}"
+        );
+    }
+    for resume_tool in ["bootstrap_agent_conversation", "consume_agent_wake"] {
+        assert!(!flow.tools.contains(&resume_tool));
+    }
+}
+
+#[test]
+fn goal_agent_wait_orchestration_flow_registers_before_worker_execution_without_discovery() {
+    let flow = TOOL_RECOMMENDED_FLOWS
+        .iter()
+        .find(|flow| flow.name == "goal_agent_wait_orchestration")
+        .expect("goal_agent_wait_orchestration recommended flow");
+    let associate = flow
+        .tools
+        .iter()
+        .position(|tool| *tool == "associate_goal_agent_task")
+        .unwrap();
+    let wait = flow
+        .tools
+        .iter()
+        .position(|tool| *tool == "wait_for_agent_events")
+        .unwrap();
+    let start = flow
+        .tools
+        .iter()
+        .position(|tool| *tool == "start_agent_task_attempt")
+        .unwrap();
+    let dispatch = flow
+        .tools
+        .iter()
+        .position(|tool| *tool == "start_agent_task_endpoint_continuation")
+        .unwrap();
+    let bootstrap = flow
+        .tools
+        .iter()
+        .position(|tool| *tool == "bootstrap_agent_conversation")
+        .unwrap();
+    let consume = flow
+        .tools
+        .iter()
+        .position(|tool| *tool == "consume_agent_wake")
+        .unwrap();
+    assert!(associate < wait && wait < start && start < dispatch);
+    assert!(dispatch < bootstrap && bootstrap < consume);
+    for required in [
+        "start_agent_task_endpoint_continuation",
+        "bootstrap_agent_conversation",
+        "consume_agent_wake",
+        "read_agent_wait",
+        "get_goal",
+        "read_agent_task",
+        "update_goal",
+    ] {
+        assert!(flow.tools.contains(&required), "missing {required}");
+    }
+    let guidance = format!("{}\n{}", flow.summary, flow.manifest_purpose).to_lowercase();
+    for phrase in [
+        "before any selected worker can terminalize",
+        "explicit 1..8 task selector list",
+        "any for first-result continuation",
+        "all for fan-in",
+        "only after registration start each worker with start_agent_task_attempt followed by start_agent_task_endpoint_continuation",
+        "fresh resumed coordinator turn bootstrap the exact wake",
+        "consume it immediately",
+        "never derive the wait source list from goal correlations",
+        "not treat this flow as a scheduler",
+        "explicitly decide/update goal state",
+    ] {
+        assert!(
+            guidance.contains(phrase),
+            "Goal AgentWait flow should mention {phrase}: {guidance}"
+        );
+    }
+}
+
+#[test]
 fn edit_recommended_flow_selects_mutation_by_shape_without_weakening_guards() {
     let flow = TOOL_RECOMMENDED_FLOWS
         .iter()
@@ -323,7 +424,8 @@ fn tool_categories_and_recommended_flows_are_well_formed() {
         .expect("file_transfer category present");
     for name in [
         "import_conversation_files_to_project",
-        "export_project_artifact",
+        "transfer_project_artifact",
+        "project_artifact",
         "save_project_artifact",
         "read_project_artifact",
         "artifact_upload_begin",
@@ -339,7 +441,6 @@ fn tool_categories_and_recommended_flows_are_well_formed() {
     assert!(edit
         .iter()
         .any(|value| value == "import_conversation_files_to_project"));
-    assert!(edit.iter().any(|value| value == "export_project_artifact"));
     let flows = recommended_flows();
     assert!(!flows.is_empty());
     for flow in &flows {
@@ -365,15 +466,18 @@ fn tool_categories_and_recommended_flows_are_well_formed() {
         "bounded deterministic transforms",
         "validate: use structured validators when their canonical diagnostics",
         "native execution is first-class when the command is outside or awkward",
-        "file transfer: host/conversation attachment -> import_conversation_files_to_project",
-        "project artifact -> export_project_artifact",
-        "caller-held bounded binary -> save_project_artifact/artifact_upload_*",
-        "bounded inspection -> read_project_artifact",
+        "file transfer: host -> import_conversation_files_to_project -> project",
+        "project -> project_artifact -> host/model",
+        "project a -> transfer_project_artifact -> project b",
+        "inspect for one bounded segment",
+        "export for complete resourcelink delivery",
         "copy show_changes.head.commit",
         "review: small bounded git observations may use native git",
         "git_review_summary to map broad or unknown committed ranges",
         "git_diff_hunks for fenced, paged, or continued review",
-        "handoff: use session_summary / session_handoff_summary",
+        "handoff/recovery only",
+        "session_handoff_summary only for missing task context",
+        "never routine progress polling",
     ] {
         assert!(
             joined_flows.contains(phrase),
@@ -678,65 +782,12 @@ fn project_overview_manifest_profiles_match_intended_workflows() {
 }
 
 #[test]
-fn local_coding_compatibility_surface_stays_exact_and_ordered() {
-    assert_eq!(
-        LOCAL_CODING_TOOL_NAMES,
-        &[
-            "work_on_project",
-            "list_projects",
-            "plugin_tool",
-            "get_session_assignment",
-            "complete_session_message",
-            "coding_agent_start",
-            "coding_agent_observe",
-            "coding_agent_cancel",
-            "project_overview",
-            "list_project_tracked_files",
-            "list_project_files",
-            "search_project_texts",
-            "read_files",
-            "lsp_status",
-            "document_symbols",
-            "document_diagnostics",
-            "hover",
-            "workspace_symbols",
-            "goto_definition",
-            "find_references",
-            "call_hierarchy",
-            "apply_text_edits",
-            "apply_patch",
-            "apply_unified_diff",
-            "run_process",
-            "run_script",
-            "run_shell",
-            "run_job",
-            "observe_jobs",
-            "list_jobs",
-            "stop_job",
-            "cargo_fmt",
-            "cargo_check",
-            "cargo_test",
-            "go_test",
-            "validation_summary",
-            "git_status",
-            "git_log",
-            "git_review_summary",
-            "git_diff_hunks",
-            "show_changes",
-            "workspace_hygiene_check",
-            "finish_coding_task",
-        ]
-    );
-}
-
-#[test]
 fn coding_intent_has_independent_ordered_canonical_selection_surface() {
     let coding = TOOL_MANIFEST_INTENTS
         .iter()
         .find(|intent| intent.name == "coding")
         .expect("coding intent");
     assert_eq!(coding.tools, CODING_INTENT_TOOL_NAMES);
-    assert_ne!(coding.tools, LOCAL_CODING_TOOL_NAMES);
     assert_eq!(coding.tools.first().copied(), Some("work_on_project"));
     assert_eq!(coding.tools.last().copied(), Some("finish_coding_task"));
 

@@ -492,7 +492,11 @@ async fn runner_supports_recognizes_all_protocol_capability_names() {
                 project_path_registration: true,
                 managed_worktree: true,
                 skill_runtime: true,
+                skill_resource_execution: true,
                 skill_management: true,
+                browser_observe: true,
+                browser_control: true,
+                browser_launch: true,
                 computer_observe: true,
                 computer_application_discovery: true,
                 computer_application_launch: true,
@@ -513,6 +517,7 @@ async fn runner_supports_recognizes_all_protocol_capability_names() {
                 native_tool_plugins: true,
                 managed_ssh_resources: true,
                 runner_config_control: true,
+                instruction_runtime: true,
             },
             policy: Some(crate::runner_protocol::RunnerPolicySummary {
                 ..Default::default()

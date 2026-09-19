@@ -207,6 +207,43 @@ fn apply_patch_file_summary_schema() -> Value {
     })
 }
 
+fn apply_text_edits_file_summary_schema() -> Value {
+    json!({
+        "type": "array",
+        "maxItems": webcodex_core::apply_edits_shared::MAX_APPLY_FILE_CHANGES,
+        "description": "Server-validated per-file apply_text_edits success summaries. Final snapshots use read_revision; Runner SHA-256 values are internal and are not model-facing.",
+        "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "index": {"type": "integer", "minimum": 0},
+                "kind": {"type": "string", "enum": ["create", "edit", "delete", "rename"]},
+                "path": {"type": "string", "minLength": 1},
+                "to_path": {"anyOf": [{"type": "string", "minLength": 1}, {"type": "null"}]},
+                "changed": {"type": "boolean"},
+                "would_change": {"type": "boolean"},
+                "read_revision": {
+                    "description": "Fresh model-facing snapshot revision for the final file after confirmed non-dry-run success; null for delete and dry-run results.",
+                    "anyOf": [
+                        {"type": "integer", "minimum": 1, "maximum": 9007199254740991_u64},
+                        {"type": "null"}
+                    ]
+                },
+                "edits": {
+                    "type": "array",
+                    "maxItems": webcodex_core::apply_edits_shared::MAX_APPLY_TEXT_EDITS,
+                    "items": {"type": "object"},
+                    "description": "Bounded source-free per-edit summaries reported by the Runner."
+                }
+            },
+            "required": [
+                "index", "kind", "path", "to_path", "changed", "would_change",
+                "read_revision", "edits"
+            ]
+        }
+    })
+}
+
 fn edit_candidate_range_schema() -> Value {
     json!({
         "type": "object",
@@ -218,6 +255,24 @@ fn edit_candidate_range_schema() -> Value {
         },
         "required": ["start_line", "end_line"]
     })
+}
+
+fn conflicting_edit_ranges_schema() -> Value {
+    let mut schema = array_schema(
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "edit_index": {"type": "integer", "minimum": 0},
+                "start_line": {"type": "integer", "minimum": 1},
+                "end_line": {"type": "integer", "minimum": 1}
+            },
+            "required": ["edit_index", "start_line", "end_line"]
+        }),
+        "At most the resolved source-line ranges for conflicting edits; derived from the authoritative transactional edit plan and contains no source or replacement text.",
+    );
+    schema["maxItems"] = json!(2);
+    schema
 }
 
 fn read_files_recovery_call_schema() -> Value {
@@ -359,13 +414,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 "would_change",
                 schema_type("boolean", "Whether the batch plan changes the worktree."),
             ),
-            (
-                "files",
-                schema_type(
-                    "array",
-                    "Per-file summaries with kind, paths, changed state, and old/new sha256 values.",
-                ),
-            ),
+            ("files", apply_text_edits_file_summary_schema()),
             (
                 "changed_paths",
                 schema_type("array", "Paths touched by the edit batch."),
@@ -395,6 +444,16 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 nullable_schema("integer", "Zero-based failed file-change index when known; null or absent for batch-global failures."),
             ),
             (
+                "path_conflict_change_indices",
+                json!({
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": 2,
+                    "items": {"type": "integer", "minimum": 0, "maximum": 15},
+                    "description": "Server-preflight indices [first occupant, conflicting change] for a repeated source/destination path. May be equal for a self-conflict. Identifies the conflict, not permission to merge sequential edits."
+                }),
+            ),
+            (
                 "edit_index",
                 nullable_schema("integer", "Zero-based failed text-edit index when known; null or absent when not edit-specific."),
             ),
@@ -421,6 +480,10 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             (
                 "conflicting_edit_indices",
                 array_schema(schema_type("integer", "Zero-based edit index participating in an overlap conflict."), "The edit indices whose planned ranges overlap."),
+            ),
+            (
+                "conflicting_edit_ranges",
+                conflicting_edit_ranges_schema(),
             ),
             (
                 "recovery",

@@ -263,6 +263,7 @@ fn apply_text_edit_occurrence_capability_rejection(reason: impl AsRef<str>) -> T
         ),
         json!({
             "state_changed": false,
+            "execution_state": "not_started",
             "error_kind": "agent_capability_unavailable",
             "failure_kind": "capability_unavailable",
             "capability": crate::runner_protocol::RUNNER_CAPABILITY_APPLY_TEXT_EDIT_OCCURRENCE
@@ -278,6 +279,7 @@ fn apply_text_edit_line_scope_capability_rejection(reason: impl AsRef<str>) -> T
         ),
         json!({
             "state_changed": false,
+            "execution_state": "not_started",
             "error_kind": "agent_capability_unavailable",
             "failure_kind": "capability_unavailable",
             "capability": crate::runner_protocol::RUNNER_CAPABILITY_APPLY_TEXT_EDIT_LINE_SCOPE
@@ -453,6 +455,7 @@ fn validate_apply_text_edit(
 struct ApplyTextEditsPreflightValidationError {
     message: String,
     edit_index: Option<usize>,
+    reread_required: bool,
 }
 
 impl From<String> for ApplyTextEditsPreflightValidationError {
@@ -460,6 +463,7 @@ impl From<String> for ApplyTextEditsPreflightValidationError {
         Self {
             message,
             edit_index: None,
+            reread_required: false,
         }
     }
 }
@@ -468,7 +472,9 @@ fn validate_apply_file_change(
     index: usize,
     change: &ApplyFileChangeInput,
 ) -> Result<(), ApplyTextEditsPreflightValidationError> {
-    let valid_revision = |required: bool| -> Result<(), ApplyTextEditsPreflightValidationError> {
+    let valid_revision = |required: bool,
+                          required_edit_index: Option<usize>|
+     -> Result<(), ApplyTextEditsPreflightValidationError> {
         match change.expected_read_revision {
             Some(revision) if (1..=MAX_JSON_SAFE_INTEGER).contains(&revision) => Ok(()),
             Some(_) => Err(format!(
@@ -476,21 +482,24 @@ fn validate_apply_file_change(
                 change.kind.as_str()
             )
             .into()),
-            None if required => Err(format!(
-                "change {index} ({}): expected_read_revision is required",
-                change.kind.as_str()
-            )
-            .into()),
+            None if required => Err(ApplyTextEditsPreflightValidationError {
+                message: format!(
+                    "change {index} ({}): expected_read_revision is required",
+                    change.kind.as_str()
+                ),
+                edit_index: required_edit_index,
+                reread_required: true,
+            }),
             None => Ok(()),
         }
     };
     match change.kind {
         ApplyFileChangeKind::Edit => {
-            let positional = change
+            let positional_edit_index = change
                 .edits
                 .iter()
-                .any(|edit| edit.occurrence.is_some() || edit.line_scope.is_some());
-            valid_revision(positional)?;
+                .position(|edit| edit.occurrence.is_some() || edit.line_scope.is_some());
+            valid_revision(positional_edit_index.is_some(), positional_edit_index)?;
             if change.to_path.is_some() || change.content.is_some() {
                 return Err(
                     format!("change {index} (edit): to_path and content are not allowed").into(),
@@ -507,6 +516,7 @@ fn validate_apply_file_change(
                     return Err(ApplyTextEditsPreflightValidationError {
                         message,
                         edit_index: Some(edit_index),
+                        reread_required: false,
                     });
                 }
             }
@@ -532,7 +542,7 @@ fn validate_apply_file_change(
             }
         }
         ApplyFileChangeKind::Delete => {
-            valid_revision(true)?;
+            valid_revision(true, None)?;
             if change.to_path.is_some() || change.content.is_some() || !change.edits.is_empty() {
                 return Err(format!(
                     "change {index} (delete): to_path, content, and edits are not allowed"
@@ -541,7 +551,7 @@ fn validate_apply_file_change(
             }
         }
         ApplyFileChangeKind::Rename => {
-            valid_revision(true)?;
+            valid_revision(true, None)?;
             let to_path = change
                 .to_path
                 .as_deref()
@@ -630,6 +640,81 @@ fn transactional_edit_agent_stdout_result(
     obj["state_changed"] = json!(changed.expect("validated changed field"));
     obj["execution_state"] = json!("completed");
     ToolResult::ok(obj)
+}
+
+fn apply_text_edits_sha256(value: Option<&Value>) -> bool {
+    value
+        .and_then(Value::as_str)
+        .is_some_and(crate::apply_edits_shared::is_lowercase_hex_sha256)
+}
+
+fn validate_apply_text_edits_success_metadata(
+    output: &Value,
+    changes: &[ApplyFileChangeInput],
+    expected_dry_run: bool,
+) -> bool {
+    let Some(files) = output.get("files").and_then(Value::as_array) else {
+        return false;
+    };
+    if files.len() != changes.len() {
+        return false;
+    }
+
+    let mut any_changed = false;
+    let mut any_would_change = false;
+    for (expected_index, (file, change)) in files.iter().zip(changes).enumerate() {
+        if file.get("index").and_then(Value::as_u64) != Some(expected_index as u64)
+            || file.get("kind").and_then(Value::as_str) != Some(change.kind.as_str())
+            || file.get("path").and_then(Value::as_str) != Some(change.path.as_str())
+        {
+            return false;
+        }
+        let to_path_matches = match change.to_path.as_deref() {
+            Some(expected) => file.get("to_path").and_then(Value::as_str) == Some(expected),
+            None => matches!(file.get("to_path"), Some(Value::Null)),
+        };
+        if !to_path_matches {
+            return false;
+        }
+        if file.get("edits").and_then(Value::as_array).is_none() {
+            return false;
+        }
+
+        let old_sha256 = file.get("old_sha256");
+        let new_sha256 = file.get("new_sha256");
+        let sha_shape_valid = match change.kind {
+            ApplyFileChangeKind::Create => {
+                matches!(old_sha256, Some(Value::Null)) && apply_text_edits_sha256(new_sha256)
+            }
+            ApplyFileChangeKind::Edit | ApplyFileChangeKind::Rename => {
+                apply_text_edits_sha256(old_sha256) && apply_text_edits_sha256(new_sha256)
+            }
+            ApplyFileChangeKind::Delete => {
+                apply_text_edits_sha256(old_sha256) && matches!(new_sha256, Some(Value::Null))
+            }
+        };
+        if !sha_shape_valid {
+            return false;
+        }
+
+        let Some(changed) = file.get("changed").and_then(Value::as_bool) else {
+            return false;
+        };
+        let Some(would_change) = file.get("would_change").and_then(Value::as_bool) else {
+            return false;
+        };
+        if change.kind != ApplyFileChangeKind::Edit && !would_change {
+            return false;
+        }
+        if changed != (!expected_dry_run && would_change) {
+            return false;
+        }
+        any_changed |= changed;
+        any_would_change |= would_change;
+    }
+
+    output.get("changed").and_then(Value::as_bool) == Some(any_changed)
+        && output.get("would_change").and_then(Value::as_bool) == Some(any_would_change)
 }
 
 fn apply_patch_sha256(value: &Value) -> bool {
@@ -1691,6 +1776,34 @@ fn sanitize_apply_text_edits_model_recovery(
         result.output["conflicting_edit_indices"] = json!(indices);
     }
 
+    if conflict_kind == "overlapping_edits" {
+        if let Some(ranges) = raw_conflict
+            .get("conflicting_edit_ranges")
+            .and_then(Value::as_array)
+        {
+            let ranges = ranges
+                .iter()
+                .take(2)
+                .filter_map(|range| {
+                    let edit_index = range.get("edit_index")?.as_u64()?;
+                    let start_line = range.get("start_line")?.as_u64()?;
+                    let end_line = range.get("end_line")?.as_u64()?;
+                    if start_line == 0 || end_line < start_line {
+                        return None;
+                    }
+                    Some(json!({
+                        "edit_index": edit_index,
+                        "start_line": start_line,
+                        "end_line": end_line,
+                    }))
+                })
+                .collect::<Vec<_>>();
+            if !ranges.is_empty() {
+                result.output["conflicting_edit_ranges"] = json!(ranges);
+            }
+        }
+    }
+
     let guarded = change.is_some_and(|change| change.expected_read_revision.is_some());
     if let Some(candidates) = raw_conflict
         .get("candidate_ranges")
@@ -1783,7 +1896,7 @@ fn apply_text_edits_agent_stdout_result(
     project: &str,
     changes: &[ApplyFileChangeInput],
 ) -> ToolResult {
-    sanitize_apply_text_edits_model_recovery(
+    let result = sanitize_apply_text_edits_model_recovery(
         transactional_edit_agent_stdout_result(
             "apply_text_edits",
             stdout,
@@ -1792,6 +1905,17 @@ fn apply_text_edits_agent_stdout_result(
         ),
         project,
         changes,
+    );
+    if !result.success {
+        return result;
+    }
+    if validate_apply_text_edits_success_metadata(&result.output, changes, expected_dry_run) {
+        return result;
+    }
+    structured_edit_outcome_unknown_result(
+        "apply_text_edits",
+        "the Runner success payload contained invalid or contradictory file-result metadata",
+        json!({}),
     )
 }
 
@@ -1877,6 +2001,7 @@ fn compact_apply_text_edits_preflight_rejection(
     let detail = message.into();
     let mut output = json!({
         "state_changed": false,
+        "execution_state": "not_started",
         "error_kind": error_kind,
     });
     if let Some(change_index) = change_index {
@@ -1897,6 +2022,28 @@ fn compact_apply_text_edits_preflight_rejection(
     )
 }
 
+fn apply_text_edits_path_overlap(
+    first_change_index: usize,
+    change_index: usize,
+    kind: &str,
+    path: &str,
+) -> ToolResult {
+    let mut result = compact_apply_text_edits_preflight_rejection(
+        format!(
+            "change {change_index} reuses path '{path}' first occupied by change {first_change_index}; each source/destination path may appear only once"
+        ),
+        "path_overlap",
+        Some(change_index),
+        None,
+        Some(kind),
+        Some(path),
+    );
+    // Proven by Server preflight, not Runner-supplied recovery. This identifies
+    // the conflict; it does not imply sequential changes can be coalesced safely.
+    result.output["path_conflict_change_indices"] = json!([first_change_index, change_index]);
+    result
+}
+
 fn compact_apply_text_edits_path_policy_rejection(
     change_index: usize,
     kind: &str,
@@ -1908,6 +2055,7 @@ fn compact_apply_text_edits_path_policy_rejection(
         output.remove("path");
         output.remove("error");
     }
+    result.output["execution_state"] = json!("not_started");
     result.output["change_index"] = json!(change_index);
     result.output["kind"] = json!(kind);
     result
@@ -1925,6 +2073,7 @@ fn apply_text_edits_preflight_rejection(
     let detail = message.into();
     let mut output = json!({
         "state_changed": false,
+        "execution_state": "not_started",
         "error_kind": error_kind,
         "retry_guidance": retry_guidance,
     });
@@ -1962,6 +2111,7 @@ fn apply_text_edits_path_policy_rejection(
         output.remove("path");
         output.remove("error");
     }
+    result.output["execution_state"] = json!("not_started");
     result.output["change_index"] = json!(change_index);
     result.output["kind"] = json!(kind);
     result.output["retry_guidance"] =
@@ -2800,7 +2950,7 @@ impl ToolRuntime {
                 None,
             );
         }
-        let mut touched_paths = HashSet::new();
+        let mut touched_paths = std::collections::HashMap::new();
         for (change_index, change) in changes.iter().enumerate() {
             if let Err(error) = validate_edit_file_path(&change.path) {
                 return compact_apply_text_edits_path_policy_rejection(
@@ -2810,17 +2960,12 @@ impl ToolRuntime {
                     error,
                 );
             }
-            if !touched_paths.insert(change.path.as_str()) {
-                return compact_apply_text_edits_preflight_rejection(
-                    format!(
-                        "change {change_index} reuses path '{}'; each source/destination path may appear only once",
-                        change.path
-                    ),
-                    "path_overlap",
-                    Some(change_index),
-                    None,
-                    Some(change.kind.as_str()),
-                    Some(&change.path),
+            if let Some(first_index) = touched_paths.insert(change.path.as_str(), change_index) {
+                return apply_text_edits_path_overlap(
+                    first_index,
+                    change_index,
+                    change.kind.as_str(),
+                    &change.path,
                 );
             }
             if let Some(to_path) = change.to_path.as_deref() {
@@ -2832,16 +2977,12 @@ impl ToolRuntime {
                         error,
                     );
                 }
-                if !touched_paths.insert(to_path) {
-                    return compact_apply_text_edits_preflight_rejection(
-                        format!(
-                            "change {change_index} reuses destination path '{to_path}'; each source/destination path may appear only once"
-                        ),
-                        "path_overlap",
-                        Some(change_index),
-                        None,
-                        Some(change.kind.as_str()),
-                        Some(to_path),
+                if let Some(first_index) = touched_paths.insert(to_path, change_index) {
+                    return apply_text_edits_path_overlap(
+                        first_index,
+                        change_index,
+                        change.kind.as_str(),
+                        to_path,
                     );
                 }
             }
@@ -2851,9 +2992,11 @@ impl ToolRuntime {
                     .and_then(|edit_index| change.edits.get(edit_index))
                     .map(|edit| edit.kind.as_str())
                     .unwrap_or_else(|| change.kind.as_str());
-                return compact_apply_text_edits_preflight_rejection(
+                let mut result = compact_apply_text_edits_preflight_rejection(
                     validation_error.message,
-                    if validation_error.edit_index.is_some() {
+                    if validation_error.reread_required {
+                        "missing_read_revision"
+                    } else if validation_error.edit_index.is_some() {
                         "invalid_edit"
                     } else {
                         "invalid_change"
@@ -2863,6 +3006,10 @@ impl ToolRuntime {
                     Some(failed_kind),
                     Some(&change.path),
                 );
+                if validation_error.reread_required {
+                    result.output["recovery"] = read_files_recovery(&project, &change.path);
+                }
+                return result;
             }
         }
 
@@ -3049,13 +3196,50 @@ impl ToolRuntime {
             Ok(response) => response,
             Err(result) => return result,
         };
-        apply_text_edits_agent_stdout_result(
+        let mut result = apply_text_edits_agent_stdout_result(
             &response.stdout.unwrap_or_default(),
             expected_change_count,
             expected_dry_run,
             &resolved.resolved_id,
             &changes,
-        )
+        );
+        if !result.success {
+            return result;
+        }
+
+        let files = result
+            .output
+            .get_mut("files")
+            .and_then(Value::as_array_mut)
+            .expect("validated apply_text_edits success files");
+        for (file, change) in files.iter_mut().zip(&changes) {
+            let new_sha256 = file
+                .get("new_sha256")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let read_revision = if expected_dry_run || change.kind == ApplyFileChangeKind::Delete {
+                None
+            } else {
+                let final_path = match change.kind {
+                    ApplyFileChangeKind::Rename => change
+                        .to_path
+                        .as_deref()
+                        .expect("validated rename destination"),
+                    _ => change.path.as_str(),
+                };
+                let target =
+                    read_revision_target(&resolved, final_path, &runner.runner_instance_id);
+                Some(self.read_revisions.observe(
+                    target,
+                    new_sha256.expect("validated final apply_text_edits sha256"),
+                ))
+            };
+            let file = file
+                .as_object_mut()
+                .expect("validated apply_text_edits file result object");
+            file.insert("read_revision".to_string(), json!(read_revision));
+        }
+        result
     }
 }
 
@@ -4126,6 +4310,155 @@ mod tests {
         assert!(!result.success);
         assert_eq!(result.output["execution_state"], "outcome_unknown");
         assert!(result.output.get("files").is_none());
+    }
+
+    #[test]
+    fn apply_text_edits_success_metadata_rejects_invalid_file_authority() {
+        let change = ApplyFileChangeInput {
+            kind: ApplyFileChangeKind::Edit,
+            path: "file.txt".to_string(),
+            to_path: None,
+            content: None,
+            edits: Vec::new(),
+            expected_read_revision: None,
+        };
+        let valid_payload = || {
+            json!({
+                "dry_run": false,
+                "applied_count": 1,
+                "changed": true,
+                "would_change": true,
+                "files": [{
+                    "index": 0,
+                    "kind": "edit",
+                    "path": "file.txt",
+                    "to_path": null,
+                    "old_sha256": "a".repeat(64),
+                    "new_sha256": "b".repeat(64),
+                    "changed": true,
+                    "would_change": true,
+                    "edits": []
+                }],
+                "changed_paths": ["file.txt"]
+            })
+        };
+
+        let mut invalid = Vec::new();
+        let mut wrong_index = valid_payload();
+        wrong_index["files"][0]["index"] = json!(1);
+        invalid.push(wrong_index);
+        let mut wrong_path = valid_payload();
+        wrong_path["files"][0]["path"] = json!("retargeted.txt");
+        invalid.push(wrong_path);
+        let mut wrong_to_path = valid_payload();
+        wrong_to_path["files"][0]["to_path"] = json!("retargeted.txt");
+        invalid.push(wrong_to_path);
+        let mut wrong_kind = valid_payload();
+        wrong_kind["files"][0]["kind"] = json!("rename");
+        invalid.push(wrong_kind);
+        let mut missing_files = valid_payload();
+        missing_files.as_object_mut().unwrap().remove("files");
+        invalid.push(missing_files);
+        let mut duplicate_file = valid_payload();
+        let duplicate = duplicate_file["files"][0].clone();
+        duplicate_file["files"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate);
+        invalid.push(duplicate_file);
+        let mut malformed_new_sha = valid_payload();
+        malformed_new_sha["files"][0]["new_sha256"] = json!("ABC");
+        invalid.push(malformed_new_sha);
+        let mut contradictory_changed = valid_payload();
+        contradictory_changed["files"][0]["changed"] = json!(false);
+        invalid.push(contradictory_changed);
+        let mut contradictory_would_change = valid_payload();
+        contradictory_would_change["files"][0]["would_change"] = json!(false);
+        invalid.push(contradictory_would_change);
+
+        for payload in invalid {
+            let result = apply_text_edits_agent_stdout_result(
+                &payload.to_string(),
+                1,
+                false,
+                "agent:test:demo",
+                std::slice::from_ref(&change),
+            );
+            assert!(!result.success);
+            assert_eq!(result.output["execution_state"], "outcome_unknown");
+            assert!(result.output["state_changed"].is_null());
+            assert!(result.output.get("files").is_none());
+            assert!(result.output.get("read_revision").is_none());
+            assert!(result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("invalid or contradictory file-result metadata"));
+        }
+
+        let create = ApplyFileChangeInput {
+            kind: ApplyFileChangeKind::Create,
+            path: "created.txt".to_string(),
+            to_path: None,
+            content: Some("created".to_string()),
+            edits: Vec::new(),
+            expected_read_revision: None,
+        };
+        let create_with_old_sha = json!({
+            "dry_run": false, "applied_count": 1, "changed": true, "would_change": true,
+            "files": [{"index":0,"kind":"create","path":"created.txt","to_path":null,"old_sha256":"a".repeat(64),"new_sha256":"b".repeat(64),"changed":true,"would_change":true,"edits":[]}],
+            "changed_paths": ["created.txt"]
+        });
+        let create_noop = json!({
+            "dry_run": false, "applied_count": 1, "changed": false, "would_change": false,
+            "files": [{"index":0,"kind":"create","path":"created.txt","to_path":null,"old_sha256":null,"new_sha256":"b".repeat(64),"changed":false,"would_change":false,"edits":[]}],
+            "changed_paths": []
+        });
+        let create_noop_result = apply_text_edits_agent_stdout_result(
+            &create_noop.to_string(),
+            1,
+            false,
+            "agent:test:demo",
+            std::slice::from_ref(&create),
+        );
+        assert!(!create_noop_result.success);
+        assert_eq!(
+            create_noop_result.output["execution_state"],
+            "outcome_unknown"
+        );
+
+        let create_result = apply_text_edits_agent_stdout_result(
+            &create_with_old_sha.to_string(),
+            1,
+            false,
+            "agent:test:demo",
+            &[create],
+        );
+        assert!(!create_result.success);
+        assert_eq!(create_result.output["execution_state"], "outcome_unknown");
+
+        let delete = ApplyFileChangeInput {
+            kind: ApplyFileChangeKind::Delete,
+            path: "deleted.txt".to_string(),
+            to_path: None,
+            content: None,
+            edits: Vec::new(),
+            expected_read_revision: Some(1),
+        };
+        let delete_with_new_sha = json!({
+            "dry_run": false, "applied_count": 1, "changed": true, "would_change": true,
+            "files": [{"index":0,"kind":"delete","path":"deleted.txt","to_path":null,"old_sha256":"a".repeat(64),"new_sha256":"b".repeat(64),"changed":true,"would_change":true,"edits":[]}],
+            "changed_paths": ["deleted.txt"]
+        });
+        let delete_result = apply_text_edits_agent_stdout_result(
+            &delete_with_new_sha.to_string(),
+            1,
+            false,
+            "agent:test:demo",
+            &[delete],
+        );
+        assert!(!delete_result.success);
+        assert_eq!(delete_result.output["execution_state"], "outcome_unknown");
     }
 
     #[test]

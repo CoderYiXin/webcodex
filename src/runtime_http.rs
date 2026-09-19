@@ -157,6 +157,7 @@ fn prepare_action_tools_call_response(
     project: Option<String>,
     result: crate::tool_runtime::ToolResult,
     model_ergonomics: Option<&ModelErgonomicsCompletion>,
+    correlation: &crate::tool_runtime::ToolCallCorrelation,
 ) -> (StatusCode, crate::tool_runtime::ToolResult) {
     let status = if result.success {
         StatusCode::OK
@@ -171,6 +172,9 @@ fn prepare_action_tools_call_response(
         .and_then(|record| serde_json::to_value(record).ok())
     {
         summary["model_ergonomics"] = telemetry;
+    }
+    if let Some(composition) = correlation.code_mode_composition_audit_summary() {
+        summary["code_mode_composition"] = composition;
     }
     let mut event = ActionAuditRecord::new(tool.to_string(), response.success, status)
         .error(response.error.clone())
@@ -416,6 +420,7 @@ pub async fn tools_call(req: &mut Request, depot: &mut Depot, res: &mut Response
                 outcome.project,
                 result,
                 model_ergonomics.as_ref(),
+                &outcome.correlation,
             );
             let response_value = guard
                 .enabled()
@@ -633,7 +638,7 @@ fn gpt_action_admit_target(path_tool: &str, target: &str) -> Result<(), String> 
             "runtime tool '{target}' is not available through GPT Actions"
         ));
     }
-    let route = crate::model_surface::adaptive_runtime_gateway_target_route(target);
+    let route = crate::model_surface::gpt_action_gateway_target_route(target);
     if path_tool == crate::model_surface::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME {
         return match route {
             AdaptiveRuntimeGatewayTargetRoute::Gateway => Ok(()),
@@ -660,6 +665,24 @@ fn gpt_action_admit_target(path_tool: &str, target: &str) -> Result<(), String> 
         | AdaptiveRuntimeGatewayTargetRoute::Unknown => Err(format!(
             "runtime tool '{target}' is not a direct GPT Action"
         )),
+    }
+}
+
+fn gpt_action_suggested_tool_call_route(
+    target: &str,
+) -> crate::model_surface::SuggestedToolCallRoute {
+    use crate::model_surface::{AdaptiveRuntimeGatewayTargetRoute, SuggestedToolCallRoute};
+
+    if !webcodex_tool_contracts::gpt_action_tool_supported(target) {
+        return SuggestedToolCallRoute::Unavailable;
+    }
+    match crate::model_surface::gpt_action_gateway_target_route(target) {
+        AdaptiveRuntimeGatewayTargetRoute::Direct => SuggestedToolCallRoute::Direct,
+        AdaptiveRuntimeGatewayTargetRoute::Gateway => SuggestedToolCallRoute::Gateway(
+            crate::model_surface::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME,
+        ),
+        AdaptiveRuntimeGatewayTargetRoute::Recursive
+        | AdaptiveRuntimeGatewayTargetRoute::Unknown => SuggestedToolCallRoute::Unavailable,
     }
 }
 
@@ -783,12 +806,20 @@ pub async fn gpt_action_invoke(req: &mut Request, depot: &mut Depot, res: &mut R
             let result = outcome
                 .result
                 .expect("tool kernel outcome without error must include result");
-            let (status, response) = prepare_action_tools_call_response(
+            let (status, mut response) = prepare_action_tools_call_response(
                 &audit,
                 &tool,
                 outcome.project,
                 result,
                 outcome.model_ergonomics.as_ref(),
+                &outcome.correlation,
+            );
+            // ActionAudit above records canonical ToolRuntime truth. Only the
+            // response copy is projected to the callable Adaptive Action route.
+            crate::model_surface::project_tool_result_suggested_calls(
+                &tool,
+                &mut response,
+                &gpt_action_suggested_tool_call_route,
             );
             res.status_code(status);
             res.render(Json(response));
@@ -823,6 +854,32 @@ pub async fn runtime_status(req: &mut Request, depot: &mut Depot, res: &mut Resp
     let auth = depot.obtain::<crate::auth::AuthContext>().ok().cloned();
     let result = runtime.dispatch_with_auth(call, auth.as_ref()).await;
     render_result(res, &audit, "runtime_status", None, result);
+}
+
+#[cfg(test)]
+mod job_action_routing_tests {
+    use super::*;
+
+    #[test]
+    fn stop_job_actions_admission_and_followup_use_definition_owned_gateway_policy() {
+        let gateway = crate::model_surface::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME;
+        assert!(gpt_action_admit_target(gateway, "stop_job").is_ok());
+        assert!(gpt_action_admit_target("stop_job", "stop_job").is_err());
+        assert_eq!(
+            gpt_action_suggested_tool_call_route("stop_job"),
+            crate::model_surface::SuggestedToolCallRoute::Gateway(gateway)
+        );
+        for definition in webcodex_tool_contracts::model_visible_tool_definitions() {
+            if definition.gpt_action_exposure()
+                == webcodex_tool_contracts::ToolGptActionExposure::GatewayOnly
+            {
+                assert!(gpt_action_admit_target(gateway, definition.name).is_ok());
+                assert!(gpt_action_admit_target(definition.name, definition.name).is_err());
+            }
+        }
+        assert!(gpt_action_admit_target(gateway, "cancel_job").is_err());
+        assert!(gpt_action_admit_target(gateway, gateway).is_err());
+    }
 }
 
 #[cfg(test)]

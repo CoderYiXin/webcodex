@@ -16,6 +16,11 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use webcodex_core::runner_skill::{
+    RunnerSkillExecutionRequest, RUNNER_SKILL_EXECUTION_REQUEST_KIND,
+};
+
+const RUNNER_TEST_COMMAND_TIMEOUT_SECS: u64 = 45;
 
 pub(in crate::tool_runtime::tests) async fn register_runner_project_at_path(
     runtime: &ToolRuntime,
@@ -170,6 +175,65 @@ pub(in crate::tool_runtime::tests) async fn register_runner_project_at_path_with
     crate::tool_runtime::runner_project_runtime_id(client_id, project_id)
 }
 
+pub(in crate::tool_runtime::tests) fn run_runner_skill_resource_request_locally(
+    req: &RunnerRequest,
+    script: &str,
+) -> (i32, String, String) {
+    assert_eq!(req.kind, RUNNER_SKILL_EXECUTION_REQUEST_KIND);
+    let skill = serde_json::from_str::<RunnerSkillExecutionRequest>(
+        req.content
+            .as_deref()
+            .expect("Skill execution request must carry typed content"),
+    )
+    .expect("decode Skill execution request");
+    let target = skill.path.as_str();
+    let extension = std::path::Path::new(target)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let mut command = match extension.as_str() {
+        "py" => {
+            const WRAPPER: &str = concat!(
+                "import os, sys\n",
+                "p = sys.argv[1]\n",
+                "a = sys.argv[2:]\n",
+                "src = sys.stdin.read()\n",
+                "sys.argv = [p, *a]\n",
+                "sys.path[0] = os.path.dirname(p)\n",
+                "g = {'__name__': '__main__', '__file__': p, '__package__': None, '__spec__': None, '__builtins__': __builtins__}\n",
+                "exec(compile(src, p, 'exec'), g, g)\n",
+            );
+            let mut command = std::process::Command::new("python3");
+            command.args(["-B", "-c", WRAPPER, target]);
+            command.args(&skill.args);
+            command
+        }
+        "sh" => {
+            let mut command =
+                std::process::Command::new(crate::tool_runtime::helpers::test_shell());
+            command.args(["-c", "script=$(cat) || exit $?; eval \"$script\"", target]);
+            command.args(&skill.args);
+            command
+        }
+        other => panic!("unsupported Skill test interpreter: {other}"),
+    };
+    if let Some(cwd) = req.cwd.as_deref() {
+        command.current_dir(cwd);
+    }
+    let (exit_code, stdout, stderr, _elapsed_ms, timed_out) =
+        crate::tool_runtime::helpers::run_test_command_with_timeout(
+            command,
+            Some(script.as_bytes()),
+            RUNNER_TEST_COMMAND_TIMEOUT_SECS,
+        );
+    assert!(
+        !timed_out,
+        "Runner Skill fixture command exceeded {RUNNER_TEST_COMMAND_TIMEOUT_SECS}s: {stderr}"
+    );
+    (exit_code, stdout, stderr)
+}
+
 pub(in crate::tool_runtime::tests) fn run_runner_shell_request_locally(
     req: &RunnerRequest,
 ) -> (i32, String, String) {
@@ -223,6 +287,8 @@ pub(in crate::tool_runtime::tests) fn run_runner_shell_request_locally(
         let mut command = std::process::Command::new(&process.executable);
         command.args(&process.args);
         (command, req.stdin.clone())
+    } else if req.kind == RUNNER_SKILL_EXECUTION_REQUEST_KIND {
+        panic!("use run_runner_skill_resource_request_locally with the Runner-owned package source")
     } else if let Some(script) = internal_posix {
         let mut command = std::process::Command::new(crate::tool_runtime::helpers::test_shell());
         command.arg("-s");
@@ -246,35 +312,19 @@ pub(in crate::tool_runtime::tests) fn run_runner_shell_request_locally(
     if let Some(cwd) = req.cwd.as_deref() {
         command.current_dir(cwd);
     }
-    if stdin_payload.is_some() {
-        command.stdin(std::process::Stdio::piped());
-    }
-    let mut child = command
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn agent shell request");
-    if let Some(stdin) = stdin_payload.as_deref() {
-        use std::io::Write;
-        let write_result = child
-            .stdin
-            .take()
-            .expect("agent shell request stdin")
-            .write_all(stdin.as_bytes());
-        if let Err(error) = write_result {
-            assert_eq!(
-                error.kind(),
-                std::io::ErrorKind::BrokenPipe,
-                "agent shell request stdin write failed: {error}"
-            );
-        }
-    }
-    let output = child.wait_with_output().unwrap();
-    (
-        output.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&output.stdout).to_string(),
-        String::from_utf8_lossy(&output.stderr).to_string(),
-    )
+    let stdin_payload = stdin_payload.as_deref().map(str::as_bytes);
+    let (exit_code, stdout, stderr, _elapsed_ms, timed_out) =
+        crate::tool_runtime::helpers::run_test_command_with_timeout(
+            command,
+            stdin_payload,
+            RUNNER_TEST_COMMAND_TIMEOUT_SECS,
+        );
+    assert!(
+        !timed_out,
+        "Runner fixture command kind={} exceeded {RUNNER_TEST_COMMAND_TIMEOUT_SECS}s: {stderr}",
+        req.kind
+    );
+    (exit_code, stdout, stderr)
 }
 
 fn run_runner_file_list_request_locally(req: &RunnerRequest) -> (i32, String, String) {

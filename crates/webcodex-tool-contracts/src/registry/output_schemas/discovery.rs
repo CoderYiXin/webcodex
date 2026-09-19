@@ -10,13 +10,6 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
         "runtime_status" => Some(wrapped_output_schema(vec![
             ("service", schema_type("string", "Runtime service name.")),
             (
-                "runtime_exposure",
-                schema_type(
-                    "string",
-                    "Configured runtime exposure: local_coding, adaptive_runtime, full_operator_runtime, or project_connector.",
-                ),
-            ),
-            (
                 "mcp_compact_schemas",
                 schema_type(
                     "boolean",
@@ -34,8 +27,8 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                             "type": "object",
                             "additionalProperties": false,
                             "properties": {
-                                "shared_key_enabled": {"type": "boolean", "description": "Whether direct shared-key quick-start authentication is effective for the running Server; false under the project-bound ProjectConnector exposure."},
-                                "anonymous_enabled": {"type": "boolean", "description": "Whether explicit open-anonymous access is effective for the running Server; false under the project-bound ProjectConnector exposure."},
+                                "shared_key_enabled": {"type": "boolean", "description": "Whether direct shared-key quick-start authentication is effective for the running Server."},
+                                "anonymous_enabled": {"type": "boolean", "description": "Whether explicit open-anonymous access is effective for the running Server."},
                                 "oauth2_enabled": {"type": "boolean", "description": "Whether OAuth2 support was enabled in the running Server configuration."},
                                 "oauth2_shared_key_bridge_enabled": {"type": "boolean", "description": "Whether the OAuth2 shared-key bridge is enabled in the running OAuth2 configuration; false whenever OAuth2 itself is disabled. This public OAuth flow is distinct from direct Bearer shared-key authentication."}
                             },
@@ -118,7 +111,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
         "list_projects" => Some(wrapped_output_schema(vec![
             (
                 "projects",
-                array_schema(open_object_schema("Project summary including capabilities.git_available, supports_cleanup_verification, and recommended_for_smoke."), "Runtime projects."),
+                array_schema(open_object_schema("Project summary including canonical id, Server-issued project_ref when a stable Project root identity is available, and capabilities.git_available/supports_cleanup_verification/recommended_for_smoke."), "Runtime projects."),
             ),
             ("count", schema_type("integer", "Project count.")),
             (
@@ -218,7 +211,8 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 schema_type("string", "Recommended next discovery action."),
             ),
         ])),
-        "tool_manifest" => Some(wrapped_output_schema(vec![
+        "tool_manifest" => {
+            let fields = vec![
             (
                 "name",
                 schema_type(
@@ -237,7 +231,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 "route",
                 json!({
                     "type": "object",
-                    "description": "Current ModelSurface invocation route only. This never grants scope, project authority, feature availability, or permission.",
+                    "description": "Canonical Adaptive Runtime invocation route only. This never grants scope, project authority, feature availability, or permission.",
                     "additionalProperties": false,
                     "properties": {
                         "mode": {
@@ -369,7 +363,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                                 "availability": {
                                     "type": "string",
                                     "enum": ["direct", "gateway", "unavailable"],
-                                    "description": "Invocation route on the current MCP ModelSurface only; authorization, feature gates, and project authority are checked separately."
+                                    "description": "Invocation route on canonical Adaptive Runtime only; authorization, feature gates, and project authority are checked separately."
                                 },
                                 "gateway_tool": {
                                     "anyOf": [
@@ -467,7 +461,20 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                     "Short list of recommended tool flows for common tasks.",
                 ),
             ),
-        ])),
+        ];
+            #[cfg(feature = "experimental-code-mode")]
+            let fields = {
+                let mut fields = fields;
+                fields.push((
+                    "code_mode_callable_contract",
+                    open_object_schema(
+                        "Bounded presentation-only callable contract attached only to exact Code Mode entry-tool discovery. It is derived from canonical ToolSpecs plus the existing Code Mode admission policy and grants no authority.",
+                    ),
+                ));
+                fields
+            };
+            Some(wrapped_output_schema(fields))
+        }
         _ => None,
     }
 }

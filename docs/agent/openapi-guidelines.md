@@ -14,24 +14,23 @@ For a generic runtime Server:
 
 ```text
 Adaptive Runtime Direct
-  - ToolDefinition.gpt_action_exposure == Unsupported
+  - ToolDefinition.gpt_action_exposure in {Unsupported, GatewayOnly}
   = GPT Action direct operations
 
-Adaptive Runtime model-visible long tail
+Adaptive Runtime model-visible long tail + definition-owned GatewayOnly
   + GPT-Action-supported
   = call_runtime_tool targets
 ```
 
-Tests must lock this relationship, not a hard-coded current direct-tool list. Changing `adaptive_runtime_direct(..., rank)` should automatically change ordinary GPT Action direct exposure.
-
-Project Connector is intentionally separate: its MCP and OpenAPI surfaces continue to derive from the canonical Connector `CapabilitySpec` registry.
+Tests must lock this relationship, not a hard-coded current direct-tool list. Changing `adaptive_runtime_direct(..., rank)` should automatically change ordinary GPT Action direct exposure unless the same definition declares an explicit exposure exception.
 
 ## 2. Action-specific state is presentation/transport only
 
 The only normal GPT Action-specific declarations are:
 
 - an optional short presentation description when the canonical description exceeds the Action importer limit;
-- an explicit `Unsupported` exposure exception for a concrete protocol incompatibility.
+- an explicit `Unsupported` exposure exception for a concrete protocol incompatibility;
+- an existing definition-owned `GatewayOnly` policy to preserve the direct-operation budget while retaining the same canonical gateway-callable tool. For example, `stop_job` is MCP/Adaptive direct but GPT Actions gateway-only, with unchanged effect, approval, authority, parser, and handler. All three experimental Code Mode entrypoints use the same gateway-only Actions policy; their ordinary Adaptive directness and nested allowlists are unchanged. Gateway target enums must include definition-owned GatewayOnly entries, not just Adaptive long-tail routes.
 
 Do not add `gpt_action_rank` or a name-based exposure allowlist. Do not exclude a tool merely because its schema is complex, its canonical description is long, or it is used infrequently.
 
@@ -74,9 +73,9 @@ Compact Action operation copy should prioritize: what the tool does, when to cho
 
 ## 5. Operation budget
 
-Generic GPT Actions must stay below the host's 30-operation limit. The generated surface is Adaptive Direct minus explicit unsupported exceptions plus `call_runtime_tool`.
+Generic GPT Actions must stay below the host's 30-operation limit. The generated surface is Adaptive Direct minus definition-owned `Unsupported` and `GatewayOnly` exceptions plus `call_runtime_tool`.
 
-Do not silently truncate operations. CI must fail if the derived projection reaches the limit so the developer explicitly decides whether a protocol-supported direct tool should move out of Adaptive Direct or whether a real GPT Action protocol exception exists.
+Do not silently truncate operations. CI must fail if the derived projection reaches the limit so the developer explicitly chooses a definition-owned GatewayOnly policy, moves a tool out of Adaptive Direct, or identifies a real protocol incompatibility. Do not raise the budget or add a second name-based registry.
 
 The Custom GPT importer also rejects OpenAPI schemas at 1 MB. Keep the generic Action document comfortably below that host ceiling: CI checks both compact and pretty-printed JSON against an internal 800,000-byte budget. Direct request schemas remain canonical, but response schemas intentionally expose only the real `ToolResult { success, output, error? }` envelope with generic `output`; complete canonical output schemas stay in `ToolSpec`/MCP rather than being duplicated into every Action response.
 
@@ -131,11 +130,9 @@ Old REST endpoints such as `/api/runtime/status`, `/api/tools/call`, `/api/proje
 
 They are not generic GPT Action operations and stay `Hidden` from the new `/openapi.json`. Route metadata describes HTTP security/surface facts; it no longer owns a generic `PublicAction` operation registry.
 
-## 10. Project Connector boundary
+## 10. Project-scoped runtime boundary
 
-Do not fold the project-bound Connector into the generic Adaptive projection. Connector MCP/OpenAPI remains a `CapabilitySpec` projection with its existing operation names, schemas, project binding, task workflow, and authority semantics.
-
-Any generic GPT Actions refactor must run the Connector OpenAPI/capability bijection tests and preserve the fourteen-capability surface unless the task explicitly changes Connector product semantics.
+Project-scoped `share`/`run` authentication does not create another OpenAPI or MCP tool registry. It projects the same canonical Adaptive Runtime and relies on scopes, ProjectGrant Runner visibility, ToolRuntime project resolution, and normal permission policy for authority. Do not introduce a project-share-specific operation vocabulary or compatibility alias layer.
 
 ## 11. Tests that matter
 
@@ -155,7 +152,6 @@ At minimum, keep focused invariants for:
 - direct Action requests enter the same kernel and match MCP authority outcomes for representative read and mutating/execution tools;
 - permission-gate denial remains effective through Action HTTP;
 - GPT Action and MCP file-import provenance cannot be asserted by public JSON;
-- Project Connector OpenAPI remains generated from its canonical capability registry.
 
 Retire tests that only preserve the old camelCase facade, `PublicAction` registry, giant `ToolCallRequest` flattened schema, or flattened manifest guidance. Tests should protect current authority/schema truth, not dead compatibility architecture.
 
@@ -170,4 +166,4 @@ Before landing a GPT Actions change:
 - verify all direct operations still use canonical ToolSpec inputs;
 - verify gateway admission is canonical and fail-closed;
 - verify file provenance remains private adapter metadata;
-- run generic OpenAPI, HTTP Action adapter, MCP surface/scope, Connector OpenAPI, and file-import focused tests.
+- run generic OpenAPI, HTTP Action adapter, MCP surface/scope, project-scoped authority, and file-import focused tests.

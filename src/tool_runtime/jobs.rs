@@ -1,6 +1,8 @@
 use serde_json::{json, Value};
 use webcodex_core::runner_job_lifecycle::RunnerJobLifecycle;
-use webcodex_core::runtime_contract::MAX_JOB_OBSERVATION_WAIT_SECS;
+use webcodex_core::runtime_contract::{
+    MAX_JOB_OBSERVATION_WAIT_SECS, MODEL_JOB_CONTINUATION_WAIT_SECS,
+};
 use webcodex_core::workflow_session_contract::is_validation_like_execution_purpose;
 
 use super::helpers::{
@@ -44,6 +46,7 @@ pub(crate) fn detected_job_summary(
         exit_code,
         stdout,
         stderr,
+        false,
         None,
     )
 }
@@ -97,6 +100,7 @@ pub(crate) fn detected_job_summary_with_activity(
     exit_code: Option<i64>,
     stdout: &str,
     stderr: &str,
+    analysis_truncated: bool,
     activity: Option<&ShellJobActivity>,
 ) -> Value {
     let normalized = command_summary
@@ -104,7 +108,8 @@ pub(crate) fn detected_job_summary_with_activity(
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    let kind = if normalized.starts_with("cargo test") {
+    let cargo_test = normalized == "cargo test" || normalized.starts_with("cargo test ");
+    let kind = if cargo_test {
         "test"
     } else if normalized.starts_with("cargo check") {
         "check"
@@ -185,6 +190,23 @@ pub(crate) fn detected_job_summary_with_activity(
         detected["zero_tests_run"] = json!(metadata.zero_tests_run);
         detected["tests_passed"] = json!(metadata.tests_passed);
         detected["tests_failed"] = json!(metadata.tests_failed);
+        if cargo_test {
+            let diagnostics = webcodex_core::validation_evidence::parse_cargo_test_diagnostics(
+                stdout,
+                stderr,
+                analysis_truncated,
+            );
+            if !diagnostics.failed_test_details.is_empty() || metadata.tests_failed.unwrap_or(0) > 0
+            {
+                detected["failed_test_details"] = json!(diagnostics
+                    .failed_test_details
+                    .iter()
+                    .map(|detail| json!({"name": detail.name}))
+                    .collect::<Vec<_>>());
+                detected["failed_test_details_truncated"] =
+                    json!(diagnostics.failed_test_details_truncated);
+            }
+        }
     }
     detected
 }
@@ -195,6 +217,66 @@ mod detected_summary_tests {
     use crate::runner_protocol::{
         ShellJobActivity, ShellJobActivityPhase, ShellJobActivitySource, ShellJobActivityState,
     };
+
+    #[test]
+    fn generic_cargo_failed_identities_are_bounded_advisory_and_truthful_when_incomplete() {
+        let stdout = (0..25).map(|index| format!("test cases::failure_{index} ... FAILED\n")).collect::<String>()
+            + "test result: FAILED. 0 passed; 25 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s\n";
+        let detected = detected_job_summary_with_activity(
+            Some("cargo test --lib"),
+            None,
+            "failed",
+            Some(101),
+            &stdout,
+            "",
+            false,
+            None,
+        );
+        assert_eq!(detected["tests_failed"], 25);
+        assert_eq!(
+            detected["failed_test_details"].as_array().unwrap().len(),
+            webcodex_core::validation_evidence::MAX_FAILED_TESTS
+        );
+        assert_eq!(
+            detected["failed_test_details"][0]["name"],
+            "cases::failure_0"
+        );
+        assert_eq!(detected["failed_test_details_truncated"], true);
+        assert!(detected.get("validation_target_id").is_none());
+        assert!(detected.get("test_count_evidence").is_none());
+        for captured in [false, true] {
+            let stdout = if captured { "test cases::captured ... FAILED\n" } else { "" }.to_string()
+                + "test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s\n";
+            let detected = detected_job_summary_with_activity(
+                Some("cargo test"),
+                None,
+                "failed",
+                Some(101),
+                &stdout,
+                "",
+                true,
+                None,
+            );
+            assert_eq!(
+                detected["failed_test_details"].as_array().unwrap().len(),
+                usize::from(captured)
+            );
+            assert_eq!(detected["failed_test_details_truncated"], true);
+        }
+        for command in ["cargo testing", "echo cargo test", "custom"] {
+            let detected = detected_job_summary_with_activity(
+                Some(command),
+                Some("test"),
+                "failed",
+                Some(1),
+                &stdout,
+                "",
+                false,
+                None,
+            );
+            assert!(detected.get("failed_test_details").is_none());
+        }
+    }
 
     #[test]
     fn cargo_progress_is_advisory_and_command_scoped() {
@@ -244,6 +326,7 @@ mod detected_summary_tests {
             None,
             "",
             "Checking webcodex v0.3.9\n",
+            false,
             Some(&activity),
         );
         assert_eq!(detected["progress"]["state"], "waiting");
@@ -677,7 +760,7 @@ pub(crate) fn observe_job_continuation(job_id: &str, observation_token: Option<&
         "observe_jobs",
         json!({
             "items": [item],
-            "wait_secs": MAX_JOB_OBSERVATION_WAIT_SECS,
+            "wait_secs": MODEL_JOB_CONTINUATION_WAIT_SECS,
             "wake_on": "terminal",
         }),
     )
@@ -1005,6 +1088,7 @@ fn active_job_continuation_brief(summary: &Value) -> Value {
 }
 
 impl ToolRuntime {
+    #[cfg(test)]
     pub(crate) async fn run_job_for_auth(
         &self,
         project: String,
@@ -1029,6 +1113,7 @@ impl ToolRuntime {
         .await
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn run_job_for_auth_with_contract(
         &self,
@@ -1339,6 +1424,10 @@ impl ToolRuntime {
                         {
                             validation["validation_target_id"] = json!(target_id);
                         }
+                        validation["source_state"] = json!(self.validation_sources.observe(
+                            job.project_id.as_deref().unwrap_or_default(),
+                            validation_metadata.and_then(|metadata| metadata.source_fence.as_ref()),
+                        ));
                         output["validation"] = validation;
                     }
                 }
@@ -1416,6 +1505,7 @@ impl ToolRuntime {
                     job.exit_code.map(i64::from),
                     &wait.analysis_stdout,
                     &wait.analysis_stderr,
+                    wait.analysis_truncated,
                     job.activity.as_ref(),
                 );
                 let validation_tool = job
@@ -1443,6 +1533,14 @@ impl ToolRuntime {
                         .and_then(|metadata| metadata.require_tests),
                     job.validation.as_ref().and_then(|metadata| metadata.no_run),
                 );
+                if let Some(validation) = validation.as_mut() {
+                    validation["source_state"] = json!(self.validation_sources.observe(
+                        job.project_id.as_deref().unwrap_or_default(),
+                        job.validation
+                            .as_ref()
+                            .and_then(|metadata| metadata.source_fence.as_ref()),
+                    ));
+                }
                 if let (Some(validation), Some(target_id)) = (
                     validation.as_mut(),
                     job.validation
